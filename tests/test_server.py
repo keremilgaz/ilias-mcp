@@ -14,6 +14,7 @@ EXPECTED = {
     "ilias_status", "ilias_list_courses", "ilias_list_items", "ilias_page_text",
     "ilias_list_assignments", "ilias_read_file", "ilias_list_forum_topics",
     "ilias_list_news", "ilias_scan", "ilias_commit_scan", "ilias_download_file",
+    "ilias_check_all",
 }
 
 
@@ -57,3 +58,24 @@ def test_errors_come_back_as_data(mcp) -> None:
     )
     data = _payload(result)
     assert "read-only policy" in data["error"]
+
+
+def test_check_all_runs_in_background(mcp, service, monkeypatch) -> None:
+    import threading
+    release = threading.Event()
+    real = service.check_all
+
+    def slow(**kwargs):
+        release.wait(5)
+        return real(**kwargs)
+
+    monkeypatch.setattr(service, "check_all", slow)
+    server._job = None
+    first = _payload(anyio.run(mcp.call_tool, "ilias_check_all", {"wait_seconds": 1}))
+    assert first["status"] == "running"
+    release.set()
+    second = _payload(anyio.run(mcp.call_tool, "ilias_check_all", {"wait_seconds": 20}))
+    assert "check_id" in second and second["semester"] == "Winter semester 2026"
+    # The finished result is handed out once; the next call starts a fresh check.
+    third = _payload(anyio.run(mcp.call_tool, "ilias_check_all", {"wait_seconds": 20}))
+    assert third["check_id"] != second["check_id"]

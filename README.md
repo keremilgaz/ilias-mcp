@@ -101,7 +101,7 @@ To skip that check when running setup again, use `bash setup.sh --skip-check`.
 | `ILIAS_CLIENT_ID` | `ILIASKONSTANZ` |
 | `ILIAS_LANG` | `en`; the session UI language follows your ILIAS profile |
 | `ILIAS_MIN_INTERVAL` | `1.0` seconds between requests; minimum `0.5` |
-| `ILIAS_MAX_REQUESTS_PER_CALL` | `60`; `ilias_scan` uses `120` |
+| `ILIAS_MAX_REQUESTS_PER_CALL` | `60`; `ilias_scan` uses `120`, `ilias_check_all` `400` |
 | `ILIAS_TIMEOUT` | `30.0` seconds |
 | `ILIAS_KEYCHAIN_SERVICE` | `ilias-mcp` |
 | `ILIAS_CACHE_DIR` | `~/Library/Caches/ilias-mcp` on macOS |
@@ -121,8 +121,9 @@ To skip that check when running setup again, use `bash setup.sh --skip-check`.
 | `ilias_list_forum_topics` | Thread titles, post counts, and last activity; does not open threads |
 | `ilias_list_news` | Dashboard or course news |
 | `ilias_page_text` | Readable page text as a fallback for announcements or schedules |
+| `ilias_check_all` | All courses of the current semester in one call: only what changed, deadlines in the next 14 days, and new news. Runs in the background; call again while it reports `running` |
 | `ilias_scan` | New, changed, and removed items compared with the saved course state |
-| `ilias_commit_scan` | Saves a scan as the reference for the next comparison |
+| `ilias_commit_scan` | Saves a scan, or a whole check by its `check_id`, as the reference for the next comparison |
 | `ilias_download_file` | Saves a file under the configured download folder without replacing a different file |
 | `ilias_status` | Configuration, login state, request counter, and request policy |
 

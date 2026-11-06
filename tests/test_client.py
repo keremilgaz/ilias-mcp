@@ -10,7 +10,7 @@ from .conftest import PASSWORD
 def test_logs_in_lazily_and_fetches(client: IliasClient, fake) -> None:
     page = client.get_page("/goto.php/crs/2125765")
     assert "Advances in Agentic AI" in page.html
-    assert page.url.endswith("cmd=view&ref_id=2125765")
+    assert page.url.endswith("cmdClass=ilobjcoursegui&ref_id=2125765")
     assert fake.login_posts == 1
     assert client.logged_in
 

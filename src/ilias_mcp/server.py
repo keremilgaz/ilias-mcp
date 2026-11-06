@@ -6,6 +6,8 @@ import functools
 import importlib
 import logging
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,13 +31,16 @@ Read-only access to the user's own ILIAS courses (University of Konstanz).
 Nothing here can submit, post, join, leave, delete or mark anything as read:
 the client only sends GET requests and refuses state-changing links.
 
-Typical flow: ilias_list_courses -> ilias_scan (per course, finds new/changed
-items since the last committed scan) -> ilias_read_file for new PDFs ->
-ilias_commit_scan once the findings are recorded.
+Typical flow: ilias_check_all (every course of the current semester in one
+call; returns only what changed since the last committed check) ->
+ilias_read_file for new PDFs -> ilias_commit_scan(check_id) once the findings
+are recorded. ilias_scan does the same for a single course.
 ilias_read_file remembers which pages of which file version were read and
 returns 'already_read' for unchanged files unless pages are asked for.
 Targets accept a URL, 'crs/123' style references or a bare ref_id.
-Requests are rate-limited; prefer one course at a time.
+Requests are rate-limited (one per second), so a full check takes about a
+minute; ilias_check_all keeps working in the background and is simply called
+again until it returns its result.
 """
 
 mcp = MCPServer(name="ilias", version=__version__, instructions=INSTRUCTIONS)
@@ -208,10 +213,82 @@ def ilias_scan(
                         include_assignments=include_assignments, include_forums=include_forums)
 
 
+# -- ilias_check_all: one call for the whole semester ------------------------------
+# A full check takes longer than clients like to wait for one tool call, so it
+# runs in a background thread. Each call waits up to `wait_seconds` and returns
+# either the result or a progress report; calling again keeps waiting on the
+# same check instead of starting a new one.
+
+_job_lock = threading.Lock()
+_job: dict[str, Any] | None = None
+
+
+def _start_check(service: IliasService, exclude: list[str], section: str | None, depth: int) -> dict:
+    job: dict[str, Any] = {"done": threading.Event(), "result": None, "progress": {},
+                           "started": time.monotonic(), "collected": False}
+
+    def run() -> None:
+        try:
+            with service.client.call_scope(400):
+                job["result"] = service.check_all(exclude=exclude, section=section, depth=depth,
+                                                  progress=job["progress"].update)
+        except PolicyViolation as exc:
+            job["result"] = {"error": f"blocked by the read-only policy: {exc}"}
+        except (LoginError, CredentialError) as exc:
+            job["result"] = {"error": f"login problem: {exc}"}
+        except Exception as exc:  # report anything else instead of losing the job
+            job["result"] = {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            job["done"].set()
+
+    threading.Thread(target=run, name="ilias-check-all", daemon=True).start()
+    return job
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def ilias_check_all(
+    exclude: list[str] | None = None,
+    section: str | None = None,
+    depth: int = 1,
+    wait_seconds: int = 40,
+) -> dict:
+    """Check every course of the current semester in one go and return only what changed
+    since the last committed check: new/changed/removed files, assignments, forum threads
+    and course-page text, plus deadlines in the next 14 days and new dashboard news.
+
+    The semester is the newest dashboard section unless `section` is given; `exclude`
+    takes ref_ids ('2101331' or 'crs/2101331') of courses to skip. The check runs in the
+    background: if the answer is status 'running', call this tool again to keep waiting
+    (it does not start a second check). Afterwards call ilias_commit_scan(check_id).
+    """
+
+    def work() -> dict:
+        global _job
+        service = get_service()
+        with _job_lock:
+            job = _job
+            if job is None or job["collected"]:
+                _reload_parsers()
+                job = _job = _start_check(service, list(exclude or []), section, max(0, min(int(depth), 3)))
+        if job["done"].wait(timeout=max(1, min(int(wait_seconds), 55))):
+            with _job_lock:
+                job["collected"] = True
+            return job["result"]
+        return {
+            "status": "running",
+            "progress": dict(job["progress"]),
+            "elapsed_seconds": round(time.monotonic() - job["started"]),
+            "hint": "Still checking (one request per second). Call ilias_check_all again to keep waiting.",
+        }
+
+    return await anyio.to_thread.run_sync(work)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False))
 @_tool()
 def ilias_commit_scan(service: IliasService, scan_id: str) -> dict:
-    """Make a scan the new baseline (local bookkeeping only; nothing is sent to ILIAS)."""
+    """Make a scan, or a whole ilias_check_all check (pass its check_id), the new baseline.
+    Local bookkeeping only; nothing is sent to ILIAS."""
     return service.commit_scan(scan_id)
 
 

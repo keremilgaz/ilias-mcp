@@ -8,12 +8,13 @@ import hashlib
 import json
 import re
 import uuid
+from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from . import dates, parsers
-from .client import BudgetExceeded, IliasClient, IliasError, LoginError
+from .client import BudgetExceeded, IliasClient, IliasError, LoginError, Page
 from .config import Settings
 from .policy import PolicyViolation
 from .files import (
@@ -25,6 +26,24 @@ from .files import (
 )
 
 CRAWLABLE = {"fold", "grp", "sess", "copa"}
+_TYPED_TARGET = re.compile(r"([a-z]{2,5})[/_](\d+)")
+_SEMESTER = re.compile(
+    r"(?P<season>winter|wintersemester|wise|ws|summer|sommersemester|sose|ss)\D{0,12}(?P<year>\d{4})", re.I
+)
+
+
+def latest_semester(sections: Iterable[str]) -> str | None:
+    """The newest semester label among dashboard sections ('Wintersemester 2026' > 'Sommersemester 2026')."""
+    best: tuple[tuple[int, int], str] | None = None
+    for section in set(sections):
+        match = _SEMESTER.search(section or "")
+        if not match:
+            continue
+        winter = match.group("season").lower().startswith("w")
+        key = (int(match.group("year")), 1 if winter else 0)
+        if best is None or key > best[0]:
+            best = (key, section)
+    return best[1] if best else None
 
 
 def target_url(target: str) -> str:
@@ -61,6 +80,72 @@ class IliasService:
         (self.snapshots / "pending").mkdir(parents=True, exist_ok=True)
         # File listings seen in this process; trusted to skip a re-download.
         self._fresh_listing: dict[str, dict] = {}
+        # Direct ilias.php routes per object type, learned from goto redirects.
+        # Using them skips the redirect hop: one request per page instead of two.
+        self._routes_path = Path(settings.cache_dir) / "routes.json"
+        self._routes: dict[str, dict] = self._load_routes()
+
+    # -- routes ------------------------------------------------------------------
+
+    def _load_routes(self) -> dict[str, dict]:
+        try:
+            return json.loads(self._routes_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _save_routes(self) -> None:
+        self._routes_path.parent.mkdir(parents=True, exist_ok=True)
+        self._routes_path.write_text(json.dumps(self._routes, indent=1), "utf-8")
+
+    def _route_url(self, kind: str, ref: str, extra: dict[str, str] | None = None) -> str | None:
+        route = self._routes.get(kind)
+        if not route:
+            return None
+        params = [(k, ref if v == "{ref}" else v) for k, v in route["params"] if k not in (extra or {})]
+        params.extend((extra or {}).items())
+        return route["path"] + "?" + urlencode(params)
+
+    def _learn_route(self, kind: str, ref: str, final_url: str) -> None:
+        parts = urlsplit(final_url)
+        params = parse_qsl(parts.query, keep_blank_values=True)
+        lowered = {(k.lower(), v) for k, v in params}
+        if not parts.path.endswith("/ilias.php") or ("ref_id", ref) not in lowered:
+            return
+        if not any(k == "cmdclass" for k, _ in lowered):
+            return  # without the GUI class the route is not specific enough
+        route = {
+            "path": parts.path,
+            "params": [(k, "{ref}" if k.lower() == "ref_id" else v) for k, v in params
+                       if k.lower() not in ("rtoken", "mode", "from_overview")],
+        }
+        if self._routes.get(kind) != route:
+            self._routes[kind] = route
+            self._save_routes()
+
+    def _get_object(self, kind: str, ref: str, fallback_url: str | None = None,
+                    extra: dict[str, str] | None = None) -> Page:
+        """Open an object by type and ref_id: learned direct route first, goto link otherwise."""
+        url = self._route_url(kind, ref, extra)
+        if url:
+            try:
+                page = self.client.get_page(url)
+                if parsers.query_param(page.url, "ref_id") == ref:
+                    return page
+            except (LoginError, BudgetExceeded):
+                raise
+            except (IliasError, PolicyViolation):
+                pass
+            self._routes.pop(kind, None)  # the route no longer works; relearn it
+            self._save_routes()
+        page = self.client.get_page(fallback_url or f"/goto.php/{kind}/{ref}")
+        self._learn_route(kind, ref, page.url)
+        return page
+
+    def _open(self, target: str) -> Page:
+        match = _TYPED_TARGET.fullmatch(str(target).strip())
+        if match:
+            return self._get_object(match.group(1), match.group(2))
+        return self.client.get_page(target_url(target))
 
     # -- status ----------------------------------------------------------------
 
@@ -106,7 +191,7 @@ class IliasService:
         return item
 
     def crawl(self, target: str, depth: int = 0) -> dict:
-        root = self.client.get_page(target_url(target))
+        root = self._open(target)
         root_ref = parsers.ref_from_url(root.url)[1] or _ref_of(target)
         root_text = parsers.page_text(root.html)
         result: dict[str, Any] = {
@@ -137,7 +222,10 @@ class IliasService:
                         result["truncated"] = "request budget reached; crawl sub-folders separately"
                         continue
                     try:
-                        child = self.client.get_page(item["url"])
+                        child = (
+                            self._get_object(item["type"], item["ref_id"], item["url"])
+                            if item.get("ref_id") else self.client.get_page(item["url"])
+                        )
                     except (LoginError, BudgetExceeded):
                         raise
                     except (IliasError, PolicyViolation) as exc:  # skip this branch, keep crawling
@@ -151,7 +239,7 @@ class IliasService:
         return result
 
     def page_text(self, target: str, offset: int = 0, max_chars: int = 12000, include_links: bool = False) -> dict:
-        page = self.client.get_page(target_url(target))
+        page = self._open(target)
         text = parsers.page_text(page.html)
         chunk = text[offset : offset + max_chars]
         result: dict[str, Any] = {
@@ -179,7 +267,12 @@ class IliasService:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
     def assignments(self, target: str) -> dict:
-        page = self.client.get_page(target_url(target))
+        match = _TYPED_TARGET.fullmatch(str(target).strip())
+        show_all = {"cmd": "showOverview", "mode": "all", "from_overview": "1"}
+        if match and match.group(1) == "exc" and "exc" in self._routes:
+            page = self._get_object("exc", match.group(2), extra=show_all)  # one request
+        else:
+            page = self._open(target)
         if "mode=all" not in page.url.lower():
             page = self.client.get_page(self._show_all_url(page.url, page.html))
         found = parsers.parse_assignments(page.html, page.url)
@@ -200,7 +293,7 @@ class IliasService:
     # -- forums and news ---------------------------------------------------------
 
     def forum_topics(self, target: str) -> dict:
-        page = self.client.get_page(target_url(target))
+        page = self._open(target)
         threads = parsers.parse_forum_threads(page.html, page.url)
         result: dict[str, Any] = {"forum": parsers.page_title(page.html), "url": page.url, "threads": threads}
         if not threads:
@@ -210,7 +303,7 @@ class IliasService:
 
     def news(self, target: str | None = None) -> dict:
         if target:
-            page = self.client.get_page(target_url(target))
+            page = self._open(target)
         else:
             dash = self.client.get_page(self.settings.dashboard_url)
             link = parsers.find_link(dash.html, dash.url, r"ilpdnewsgui")
@@ -398,6 +491,8 @@ class IliasService:
         before = (previous or {}).get("state", {})
         strip = lambda s: {k: v for k, v in s.items() if not k.startswith("_")}  # noqa: E731
         new = {k: v for k, v in state.items() if k not in before}
+        if previous is not None and not any(k.startswith("page:") for k in before):
+            new.pop(f"page:{course_ref}", None)  # baseline predates page tracking: adopt, don't report
         changed = {
             k: {"before": strip(before[k]), "after": strip(v)}
             for k, v in state.items()
@@ -445,6 +540,9 @@ class IliasService:
     def commit_scan(self, scan_id: str) -> dict:
         if not re.fullmatch(r"[0-9a-f]{12}", scan_id or ""):
             raise ValueError("invalid scan_id")
+        bundle_path = self.snapshots / "pending" / f"check-{scan_id}.json"
+        if bundle_path.exists():
+            return self._commit_check(scan_id, bundle_path)
         pending_path = self.snapshots / "pending" / f"{scan_id}.json"
         if not pending_path.exists():
             raise ValueError("unknown or already committed scan_id")
@@ -454,3 +552,99 @@ class IliasService:
         target.write_text(json.dumps(pending, ensure_ascii=False), "utf-8")
         pending_path.unlink()
         return {"committed": scan_id, "course": pending.get("title"), "baseline_from": pending["scanned_at"]}
+
+    # -- one call for the whole semester -------------------------------------------
+
+    def check_all(
+        self,
+        exclude: Iterable[str] = (),
+        section: str | None = None,
+        depth: int = 1,
+        progress: Callable[[dict], None] | None = None,
+    ) -> dict:
+        """Scan every course of the current semester and return only what changed."""
+        dash = self.client.get_page(self.settings.dashboard_url)
+        entries = [i for i in parsers.parse_items(dash.html, dash.url)
+                   if i["type"] in ("crs", "grp") and i.get("ref_id")]
+        chosen = section or latest_semester(i.get("section", "") for i in entries)
+        excluded = {str(x).strip().split("/")[-1].split("_")[-1] for x in exclude}
+        targets = [i for i in entries
+                   if (chosen is None or i.get("section") == chosen) and i["ref_id"] not in excluded]
+        news = parsers.parse_news(dash.html, dash.url)
+        last_check = self._last_check()
+
+        courses: list[dict] = []
+        deadlines: list[dict] = []
+        scan_ids: list[str] = []
+        for number, course in enumerate(targets, 1):
+            if progress:
+                progress({"course": course["title"], "course_number": number, "courses": len(targets),
+                          "requests": self.client.call_requests})
+            try:
+                scan = self.scan(f"{course['type']}/{course['ref_id']}", depth=depth)
+            except (LoginError, BudgetExceeded):
+                raise
+            except Exception as exc:  # one broken course must not hide the others
+                courses.append({"course": course["title"], "ref_id": course["ref_id"],
+                                "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            scan_ids.append(scan["scan_id"])
+            entry = {"course": scan["course"], "ref_id": scan["ref_id"],
+                     "changes": len(scan["new"]) + len(scan["changed"]) + len(scan["removed"])}
+            for key in ("new", "changed", "removed", "notes", "incomplete", "warning", "note", "compared_with"):
+                if scan.get(key):
+                    entry[key] = scan[key]
+            courses.append(entry)
+            deadlines.extend({"course": scan["course"], **d} for d in scan["upcoming_deadlines"])
+
+        now = dates.now_berlin()
+        horizon = now + timedelta(days=14)
+        upcoming = sorted((d for d in deadlines if dates.parse_iso(d["deadline"]) <= horizon),
+                          key=lambda d: d["deadline"])
+        fresh_news = [n for n in news if last_check is None
+                      or (n.get("date") and dates.parse_iso(n["date"]) > dates.parse_iso(last_check))]
+        check_id = uuid.uuid4().hex[:12]
+        (self.snapshots / "pending" / f"check-{check_id}.json").write_text(json.dumps(
+            {"scan_ids": scan_ids, "checked_at": now.isoformat(timespec="minutes")}), "utf-8")
+
+        attention = [c for c in courses if c.get("changes") or c.get("error") or c.get("incomplete")]
+        quiet = [c["course"] for c in courses if c not in attention]
+        return {
+            "check_id": check_id,
+            "checked_at": now.isoformat(timespec="minutes"),
+            "previous_check": last_check,
+            "semester": chosen,
+            "excluded": sorted(excluded),
+            "summary": (f"{len(attention)} of {len(courses)} courses need attention, "
+                        f"{len(fresh_news)} news item(s) since the previous check"),
+            "courses_with_changes": attention,
+            "unchanged_courses": quiet,
+            "upcoming_deadlines_14_days": upcoming,
+            "news_since_previous_check": fresh_news,
+            "requests_used": self.client.call_requests,
+            "next_step": "record the findings, then ilias_commit_scan(check_id)",
+        }
+
+    def _last_check(self) -> str | None:
+        path = self.snapshots / "last-check.json"
+        try:
+            return json.loads(path.read_text("utf-8")).get("checked_at")
+        except (OSError, ValueError):
+            return None
+
+    def _commit_check(self, check_id: str, bundle_path: Path) -> dict:
+        bundle = json.loads(bundle_path.read_text("utf-8"))
+        committed, missing = [], []
+        for scan_id in bundle["scan_ids"]:
+            try:
+                committed.append(self.commit_scan(scan_id)["course"])
+            except ValueError:
+                missing.append(scan_id)
+        (self.snapshots / "last-check.json").write_text(json.dumps(
+            {"checked_at": bundle["checked_at"], "committed_at": dates.now_berlin().isoformat(timespec="minutes")}),
+            "utf-8")
+        bundle_path.unlink()
+        result: dict[str, Any] = {"committed": check_id, "courses": committed, "baseline_from": bundle["checked_at"]}
+        if missing:
+            result["already_committed_or_missing"] = missing
+        return result

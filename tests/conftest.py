@@ -56,6 +56,7 @@ class FakeIlias:
         self.sessions: set[str] = set()
         self.login_posts = 0
         self.files: dict[str, tuple[bytes, str]] = {}
+        self.fail_when = None  # optional predicate: answer matching requests with 404
         self.pages = {
             ("/ilias.php", "ildashboardgui", "jumptoselecteditems"): "dashboard.html",
             ("/ilias.php", "ildashboardgui", ""): "news.html",
@@ -71,6 +72,8 @@ class FakeIlias:
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if self.fail_when is not None and self.fail_when(request):
+            return httpx.Response(404)
         url = request.url
         path = url.path
         q = {k.lower(): v[0] for k, v in parse_qs(urlsplit(str(url)).query).items()}
@@ -109,7 +112,9 @@ class FakeIlias:
                 )
             if kind == "trap":
                 return self.redirect(f"/ilias.php?baseClass=ilrepositorygui&cmd=leave&ref_id={ref}")
-            return self.redirect(f"/ilias.php?baseClass=ilrepositorygui&cmd=view&ref_id={ref}")
+            gui = {"crs": "ilobjcoursegui", "fold": "ilobjfoldergui", "frm": "ilObjForumGUI",
+                   "sess": "ilobjsessiongui", "grp": "ilobjgroupgui"}.get(kind, "ilobjgui")
+            return self.redirect(f"/ilias.php?baseClass=ilrepositorygui&cmdNode=zb:p1&cmdClass={gui}&ref_id={ref}")
         base_class = q.get("baseclass", "").lower()
         cmd = q.get("cmd", "").lower()
         if cmd == "sendfile":

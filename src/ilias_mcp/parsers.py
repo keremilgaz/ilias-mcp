@@ -189,6 +189,9 @@ def page_links(html: str, page_url: str, limit: int = 150) -> list[dict]:
     """Links in the main area (minus action links), for following up."""
     soup = soupify(html)
     root = content_root(soup)
+    for selector in _NOISE:  # same clean-up as page_text (calendar, menus, ...)
+        for tag in root.select(selector):
+            tag.decompose()
     seen: set[str] = set()
     out: list[dict] = []
     for a in root.find_all("a", href=True):

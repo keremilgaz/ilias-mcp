@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import pytest
 
 from ilias_mcp import dates
@@ -137,3 +138,60 @@ def test_incomplete_scan_is_flagged(service: IliasService, fake) -> None:
     assert later["incomplete"] is True
     assert any("Lecture Content" in n for n in later["notes"])
     assert "item:2131770" in {r["key"] for r in later["removed"]}  # why the warning matters
+
+
+def test_learned_routes_skip_the_goto_redirect(service: IliasService, fake) -> None:
+    service.crawl("crs/2125765", depth=1)
+    first = len(fake.requests)
+    service.crawl("crs/2125765", depth=1)
+    second = fake.requests[first:]
+    assert not any("/goto.php/" in str(r.url) for r in second)  # direct routes only
+    assert len(second) < first - 1  # fewer requests than the first crawl (which also logged in)
+    assignments = service.assignments("exc/2104815")  # learned from the first visit's redirect
+    assert [a["ass_id"] for a in assignments["assignments"]] == ["501", "500"]
+
+
+def test_broken_route_falls_back_to_goto(service: IliasService, fake) -> None:
+    service.crawl("crs/2125765")
+    service._routes["crs"]["params"].append(["broken", "1"])
+    fake.fail_when = lambda request: "broken=1" in str(request.url)
+    result = service.crawl("crs/2125765")
+    assert result["page"]["ref_id"] == "2125765"
+    assert any("/goto.php/crs/2125765" in str(r.url) for r in fake.requests[-3:])
+    assert "broken" not in str(service._routes["crs"])  # relearned from the goto redirect
+
+
+def test_latest_semester() -> None:
+    from ilias_mcp.service import latest_semester
+    assert latest_semester(["Sommersemester 2026", "Wintersemester 2025", "Wintersemester 2026"]) == "Wintersemester 2026"
+    assert latest_semester(["Summer semester 2027", "Winter semester 2026"]) == "Summer semester 2027"
+    assert latest_semester(["Courses"]) is None
+
+
+def test_check_all_reports_only_changes(service: IliasService, fake, monkeypatch) -> None:
+    monkeypatch.setattr(dates, "now_berlin", lambda: datetime(2026, 11, 6, 9, 0, tzinfo=dates.BERLIN))
+    first = service.check_all(exclude=["crs/2099965"])
+    assert first["semester"] == "Winter semester 2026"
+    assert first["excluded"] == ["2099965"]
+    assert [c["ref_id"] for c in first["courses_with_changes"]] == ["2125765"]  # first scan: all new
+    assert [d["title"] for d in first["upcoming_deadlines_14_days"]] == ["Assignment 3: Literature Review"]
+    service.commit_scan(first["check_id"])
+
+    second = service.check_all(exclude=["2099965"])
+    assert second["courses_with_changes"] == []
+    assert second["unchanged_courses"] == ["Advances in Agentic AI"]
+    assert second["previous_check"] == first["checked_at"]
+    with pytest.raises(ValueError):
+        service.commit_scan(first["check_id"])  # already committed
+
+
+def test_page_state_adopted_for_old_baselines(service: IliasService) -> None:
+    import json as _json
+    scan = service.scan("crs/2125765", depth=0)
+    service.commit_scan(scan["scan_id"])
+    path = service.snapshots / "2125765.json"
+    data = _json.loads(path.read_text())
+    data["state"] = {k: v for k, v in data["state"].items() if not k.startswith("page:")}
+    path.write_text(_json.dumps(data))  # what a baseline from version 0.1 looks like
+    again = service.scan("crs/2125765", depth=0)
+    assert again["new"] == []

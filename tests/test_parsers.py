@@ -169,3 +169,10 @@ def test_deadline_labels(label) -> None:
     entry = parsers.parse_assignments(html, f"{BASE}/ilias.php")[0]
     assert entry["deadline"] == "2026-11-11T10:00+01:00"
     assert entry["start"] == "2026-11-01T10:00+01:00"
+
+
+def test_page_links_skip_calendar_and_menus() -> None:
+    links = parsers.page_links(fixture("course.html"), f"{BASE}/ilias.php")
+    texts = {l["text"] for l in links}
+    assert "Lecture Content" in texts
+    assert not texts & {"Mo", "Tu", "Add to Favourites", "Upcoming events"}
