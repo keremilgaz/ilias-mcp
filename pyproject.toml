@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ilias-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for ILIAS (University of Konstanz)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Kerem Ilgaz" }]
+keywords = ["ilias", "mcp", "model-context-protocol", "claude", "university-of-konstanz"]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2.3,<3",
+    "httpx>=0.27,<1",
+    "beautifulsoup4>=4.12",
+    "pypdf>=5.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "reportlab>=4"]
+
+[project.scripts]
+ilias-mcp = "ilias_mcp.server:main"
+ilias-mcp-check = "ilias_mcp.check:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

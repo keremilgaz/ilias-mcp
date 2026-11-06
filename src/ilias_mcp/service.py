@@ -1,0 +1,449 @@
+"""The operations behind the MCP tools. Synchronous and network-agnostic:
+everything goes through :class:`IliasClient`, so tests can swap the transport.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import uuid
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from . import dates, parsers
+from .client import BudgetExceeded, IliasClient, IliasError, LoginError
+from .config import Settings
+from .policy import PolicyViolation
+from .files import (
+    FileCache,
+    compact_ranges,
+    listing_signature,
+    parse_page_spec,
+    search_pages,
+)
+
+CRAWLABLE = {"fold", "grp", "sess", "copa"}
+
+
+def target_url(target: str) -> str:
+    """Accept a URL, an ILIAS path, 'crs/123', 'crs_123' or a bare ref_id."""
+    target = str(target).strip()
+    if target.startswith(("https://", "http://")):
+        return target
+    if target.startswith("/"):
+        return target
+    match = re.fullmatch(r"([a-z]{2,5})[/_](\d+)", target)
+    if match:
+        return f"/goto.php/{match.group(1)}/{match.group(2)}"
+    if target.isdigit():
+        return f"/ilias.php?baseClass=ilrepositorygui&ref_id={target}"
+    raise ValueError(f"cannot interpret target {target!r}; use a URL, 'crs/123' or a ref_id")
+
+
+def _ref_of(target: str) -> str | None:
+    target = str(target).strip()
+    if target.isdigit():
+        return target
+    match = re.fullmatch(r"[a-z]{2,5}[/_](\d+)", target)
+    if match:
+        return match.group(1)
+    return parsers.ref_from_url(target)[1]
+
+
+class IliasService:
+    def __init__(self, settings: Settings, client: IliasClient, cache: FileCache) -> None:
+        self.settings = settings
+        self.client = client
+        self.cache = cache
+        self.snapshots = Path(settings.cache_dir) / "snapshots"
+        (self.snapshots / "pending").mkdir(parents=True, exist_ok=True)
+        # File listings seen in this process; trusted to skip a re-download.
+        self._fresh_listing: dict[str, dict] = {}
+
+    # -- status ----------------------------------------------------------------
+
+    def status(self) -> dict:
+        return {
+            "base_url": self.settings.base_url,
+            "user": self.settings.username,
+            "logged_in": self.client.logged_in,
+            "requests_this_process": self.client.requests_total,
+            "min_seconds_between_requests": self.settings.min_interval,
+            "max_requests_per_call": self.settings.max_requests_per_call,
+            "cache_dir": str(self.settings.cache_dir),
+            "download_root": str(self.settings.download_root),
+            "policy": self.client.policy.describe(),
+        }
+
+    # -- courses -----------------------------------------------------------------
+
+    def list_courses(self) -> dict:
+        page = self.client.get_page(self.settings.dashboard_url)
+        courses = [i for i in parsers.parse_items(page.html, page.url) if i["type"] in ("crs", "grp")]
+        source = "dashboard"
+        if not courses:
+            page = self.client.get_page(self.settings.memberships_url)
+            courses = [i for i in parsers.parse_items(page.html, page.url) if i["type"] in ("crs", "grp")]
+            source = "memberships"
+        result: dict[str, Any] = {"source": source, "courses": courses}
+        if not courses:
+            result["hint"] = "no courses recognised; page text follows"
+            result["text"] = parsers.page_text(page.html)[:4000]
+        return result
+
+    # -- containers --------------------------------------------------------------
+
+    def _annotate(self, item: dict) -> dict:
+        if item.get("type") == "file" and item.get("ref_id"):
+            listing = listing_signature(item)
+            self._fresh_listing[item["ref_id"]] = listing
+            self.cache.remember_listing(item["ref_id"], item["title"], listing)
+            state = self.cache.status(item["ref_id"], listing)
+            if state:
+                item["already_read"] = state
+        return item
+
+    def crawl(self, target: str, depth: int = 0) -> dict:
+        root = self.client.get_page(target_url(target))
+        root_ref = parsers.ref_from_url(root.url)[1] or _ref_of(target)
+        root_text = parsers.page_text(root.html)
+        result: dict[str, Any] = {
+            "page": {
+                "title": parsers.page_title(root.html),
+                "url": root.url,
+                "ref_id": root_ref,
+                # Lets a scan notice edited announcements / schedules on the page itself.
+                "text_sha": hashlib.sha256(root_text.encode()).hexdigest()[:16],
+                "text_excerpt": root_text[:300],
+            },
+            "items": [],
+        }
+        queue: list[tuple[str, list[str], int, str]] = [(root.url, [], 0, root.html)]
+        visited = {root_ref or root.url}
+        while queue:
+            url, path, level, html = queue.pop(0)
+            for item in parsers.parse_items(html, url):
+                if item.get("ref_id") and item["ref_id"] == root_ref:
+                    continue
+                if path:
+                    item["path"] = " / ".join(path)
+                result["items"].append(self._annotate(item))
+                key = item.get("ref_id") or item["url"]
+                if level < depth and item["type"] in CRAWLABLE and key not in visited:
+                    visited.add(key)
+                    if self.client.budget_left() < 3:
+                        result["truncated"] = "request budget reached; crawl sub-folders separately"
+                        continue
+                    try:
+                        child = self.client.get_page(item["url"])
+                    except (LoginError, BudgetExceeded):
+                        raise
+                    except (IliasError, PolicyViolation) as exc:  # skip this branch, keep crawling
+                        result.setdefault("errors", []).append(f"{item['title']}: {exc}")
+                        continue
+                    queue.append((child.url, path + [item["title"]], level + 1, child.html))
+        if not result["items"]:
+            result["hint"] = "no listed objects recognised; page text follows"
+            result["text"] = parsers.page_text(root.html)[:4000]
+        result["requests_used"] = self.client.call_requests
+        return result
+
+    def page_text(self, target: str, offset: int = 0, max_chars: int = 12000, include_links: bool = False) -> dict:
+        page = self.client.get_page(target_url(target))
+        text = parsers.page_text(page.html)
+        chunk = text[offset : offset + max_chars]
+        result: dict[str, Any] = {
+            "title": parsers.page_title(page.html),
+            "url": page.url,
+            "text": chunk,
+            "total_chars": len(text),
+        }
+        if offset + max_chars < len(text):
+            result["next_offset"] = offset + max_chars
+        if include_links:
+            result["links"] = parsers.page_links(page.html, page.url)
+        return result
+
+    # -- exercises ---------------------------------------------------------------
+
+    def _show_all_url(self, page_url: str, html: str) -> str:
+        found = parsers.find_show_all_url(html, page_url)
+        if found:
+            return found
+        parts = urlsplit(page_url)
+        query = dict(parse_qsl(parts.query))
+        query.update({"cmd": "showOverview", "mode": "all", "from_overview": "1"})
+        query.pop("rtoken", None)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+
+    def assignments(self, target: str) -> dict:
+        page = self.client.get_page(target_url(target))
+        if "mode=all" not in page.url.lower():
+            page = self.client.get_page(self._show_all_url(page.url, page.html))
+        found = parsers.parse_assignments(page.html, page.url)
+        now = dates.now_berlin()
+        for entry in found:
+            if entry.get("deadline"):
+                entry["deadline_passed"] = dates.parse_iso(entry["deadline"]) < now
+        result: dict[str, Any] = {
+            "exercise": parsers.page_title(page.html),
+            "url": page.url,
+            "assignments": found,
+        }
+        if not found:
+            result["hint"] = "no assignments recognised; page text follows"
+            result["text"] = parsers.page_text(page.html)[:12000]
+        return result
+
+    # -- forums and news ---------------------------------------------------------
+
+    def forum_topics(self, target: str) -> dict:
+        page = self.client.get_page(target_url(target))
+        threads = parsers.parse_forum_threads(page.html, page.url)
+        result: dict[str, Any] = {"forum": parsers.page_title(page.html), "url": page.url, "threads": threads}
+        if not threads:
+            result["hint"] = "no threads recognised (or the forum is empty); page text follows"
+            result["text"] = parsers.page_text(page.html)[:6000]
+        return result
+
+    def news(self, target: str | None = None) -> dict:
+        if target:
+            page = self.client.get_page(target_url(target))
+        else:
+            dash = self.client.get_page(self.settings.dashboard_url)
+            link = parsers.find_link(dash.html, dash.url, r"ilpdnewsgui")
+            page = self.client.get_page(link) if link else dash
+        items = parsers.parse_news(page.html, page.url)
+        result: dict[str, Any] = {"source": parsers.page_title(page.html), "url": page.url, "news": items}
+        if not items:
+            result["hint"] = "no news items recognised; page text follows"
+            result["text"] = parsers.page_text(page.html)[:6000]
+        return result
+
+    # -- files -------------------------------------------------------------------
+
+    def _file_key_and_urls(self, target: str) -> tuple[str, list[str]]:
+        target = str(target).strip()
+        ref = _ref_of(target)
+        is_url = target.startswith(("http://", "https://", "/"))
+        if ref and (not is_url or "sendfile" in target or "/file/" in target):
+            return ref, [
+                self.settings.sendfile_template.format(ref_id=ref),
+                f"/goto.php/file/{ref}/download",
+            ]
+        if is_url:
+            return "url:" + hashlib.sha1(target.encode()).hexdigest()[:16], [target]
+        raise ValueError(f"cannot interpret file target {target!r}")
+
+    def read_file(
+        self,
+        target: str,
+        pages: str | None = None,
+        query: str | None = None,
+        force: bool = False,
+        max_chars: int = 15000,
+    ) -> dict:
+        key, urls = self._file_key_and_urls(target)
+        listing = self._fresh_listing.get(key)
+        entry = None
+        source = "cache"
+        if listing and not force:
+            entry = self.cache.version(key, listing=listing)
+        if entry is None:
+            download = self.client.get_file(urls)
+            versions_before = self.cache.version_count(key)
+            entry = self.cache.store(key, download.content, download.filename, listing)
+            source = "downloaded"
+            if versions_before and self.cache.version_count(key) > versions_before:
+                source = "downloaded_new_version"  # content differs from what was seen before
+        texts = self.cache.pages(entry["sha256"])
+        total = len(texts)
+        result: dict[str, Any] = {
+            "ref_id": key,
+            "filename": entry.get("filename"),
+            "kind": entry["kind"],
+            "pages_total": total,
+            "source": source,
+        }
+        if listing:
+            result["listing"] = listing
+        if entry["read_pages"]:
+            result["previously_read"] = compact_ranges(entry["read_pages"])
+            result["last_read"] = entry.get("last_read")
+        if not total:
+            result["note"] = "no extractable text (scanned PDF or unsupported format)"
+            return result
+
+        if query:
+            selected = parse_page_spec(pages, total)
+            hits = search_pages({p: texts[p - 1] for p in selected}, query)
+            budget, kept = max_chars, []
+            for hit in hits:
+                if budget - len(hit["snippet"]) < 0:
+                    result["hits_truncated"] = len(hits) - len(kept)
+                    break
+                kept.append(hit)
+                budget -= len(hit["snippet"])
+            result["query"] = query
+            result["hits"] = kept
+            result["pages_with_hits"] = compact_ranges([h["page"] for h in hits])
+            return result
+
+        if pages:
+            selected = parse_page_spec(pages, total)
+        else:
+            unread = [p for p in range(1, total + 1) if p not in set(entry["read_pages"])]
+            if not unread and not force:
+                result["status"] = "already_read"
+                result["hint"] = (
+                    "This exact version was fully read before. Use pages='3-4' to re-open "
+                    "specific pages, query='deadline|due' to search, or force=true."
+                )
+                return result
+            selected = unread if not force else list(range(1, total + 1))
+
+        returned: list[dict] = []
+        budget = max_chars
+        for number in selected:
+            text = texts[number - 1]
+            if returned and len(text) > budget:
+                break
+            returned.append({"page": number, "text": text[:budget]})
+            budget -= len(text)
+        done = [r["page"] for r in returned if len(r["text"]) == len(texts[r["page"] - 1])]
+        self.cache.mark_read(key, entry["sha256"], done)
+        remaining = [p for p in selected if p not in done]
+        result["returned_pages"] = compact_ranges([r["page"] for r in returned])
+        if remaining:
+            result["remaining_pages"] = compact_ranges(remaining)
+        result["text"] = returned
+        return result
+
+    def download_file(self, target: str, dest_dir: str) -> dict:
+        root = Path(self.settings.download_root).expanduser().resolve()
+        dest = Path(dest_dir).expanduser()
+        dest = (dest if dest.is_absolute() else root / dest).resolve()
+        if dest != root and root not in dest.parents:
+            raise ValueError(f"dest_dir must be inside {root}")
+        key, urls = self._file_key_and_urls(target)
+        download = self.client.get_file(urls)
+        self.cache.store(key, download.content, download.filename, self._fresh_listing.get(key))
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", download.filename or f"ilias-{key}.bin").strip() or "file"
+        dest.mkdir(parents=True, exist_ok=True)
+        path = dest / name
+        digest = hashlib.sha256(download.content).hexdigest()
+        if path.exists():
+            if hashlib.sha256(path.read_bytes()).hexdigest() == digest:
+                return {"saved_to": str(path), "status": "already_present"}
+            stem, suffix, n = path.stem, path.suffix, 2
+            while path.exists():
+                path = dest / f"{stem} ({n}){suffix}"
+                n += 1
+        path.write_bytes(download.content)
+        return {"saved_to": str(path), "bytes": len(download.content), "status": "saved"}
+
+    # -- change detection ----------------------------------------------------------
+
+    def scan(self, target: str, depth: int = 1, include_assignments: bool = True,
+             include_forums: bool = True) -> dict:
+        crawl = self.crawl(target, depth=depth)
+        course_ref = crawl["page"]["ref_id"] or _ref_of(target) or "unknown"
+        state: dict[str, dict] = {
+            f"page:{course_ref}": {
+                "title": crawl["page"]["title"],
+                "text_sha": crawl["page"]["text_sha"],
+                "_excerpt": crawl["page"]["text_excerpt"],
+            }
+        }
+        notes: list[str] = []
+        for item in crawl["items"]:
+            sig = {k: item.get(k) for k in ("type", "title", "version", "date", "size") if item.get(k)}
+            if item["type"] != "file" and item.get("description"):
+                sig["description"] = item["description"][:200]
+            if item.get("path"):
+                sig["path"] = item["path"]
+            if item.get("already_read"):
+                sig["_already_read"] = item["already_read"]
+            state[f"item:{item.get('ref_id') or item['url']}"] = sig
+        for item in crawl["items"]:
+            ref = item.get("ref_id")
+            if not ref or self.client.budget_left() < 4:
+                if ref and item["type"] in ("exc", "frm"):
+                    notes.append(f"skipped {item['type']} {ref}: request budget")
+                continue
+            try:
+                if include_assignments and item["type"] == "exc":
+                    for a in self.assignments(f"exc/{ref}")["assignments"]:
+                        state[f"ass:{ref}:{a['ass_id']}"] = {
+                            k: a.get(k) for k in ("title", "deadline", "start", "submitted", "last_submission")
+                            if a.get(k) is not None
+                        } | {"exercise": item["title"]}
+                elif include_forums and item["type"] == "frm":
+                    for t in self.forum_topics(f"frm/{ref}")["threads"]:
+                        # Total posts and last activity only: unread counts change when
+                        # the user reads a thread in the browser, which is not news.
+                        state[f"thr:{ref}:{t['thread_id']}"] = {
+                            k: v for k, v in (("forum", item["title"]), ("title", t["title"]),
+                                              ("last_activity", t.get("last_activity")),
+                                              ("posts", t.get("posts")))
+                            if v is not None
+                        }
+            except Exception as exc:  # keep scanning the rest
+                notes.append(f"{item['type']} {ref}: {type(exc).__name__}: {exc}")
+
+        previous_path = self.snapshots / f"{course_ref}.json"
+        previous = json.loads(previous_path.read_text("utf-8")) if previous_path.exists() else None
+        before = (previous or {}).get("state", {})
+        strip = lambda s: {k: v for k, v in s.items() if not k.startswith("_")}  # noqa: E731
+        new = {k: v for k, v in state.items() if k not in before}
+        changed = {
+            k: {"before": strip(before[k]), "after": strip(v)}
+            for k, v in state.items()
+            if k in before and strip(before[k]) != strip(v)
+        }
+        removed = {k: strip(v) for k, v in before.items() if k not in state}
+        scan_id = uuid.uuid4().hex[:12]
+        pending = {"target": course_ref, "title": crawl["page"]["title"], "state": state,
+                   "scanned_at": dates.now_berlin().isoformat(timespec="minutes")}
+        (self.snapshots / "pending" / f"{scan_id}.json").write_text(
+            json.dumps(pending, ensure_ascii=False), "utf-8"
+        )
+        result: dict[str, Any] = {
+            "scan_id": scan_id,
+            "course": crawl["page"]["title"],
+            "ref_id": course_ref,
+            "compared_with": previous.get("committed_at") if previous else None,
+            "new": [{"key": k, **strip(v)} for k, v in new.items()],
+            "changed": [{"key": k, **v} for k, v in changed.items()],
+            "removed": [{"key": k, **v} for k, v in removed.items()],
+            "unchanged_count": len(state) - len(new) - len(changed),
+            "upcoming_deadlines": sorted(
+                ({"key": k, **v} for k, v in state.items()
+                 if k.startswith("ass:") and v.get("deadline")
+                 and dates.parse_iso(v["deadline"]) >= dates.now_berlin()),
+                key=lambda a: a["deadline"],
+            ),
+            "requests_used": self.client.call_requests,
+        }
+        if previous is None:
+            result["note"] = "first scan of this course: everything is listed as new"
+        if crawl.get("truncated"):
+            notes.append(crawl["truncated"])
+        if notes:
+            result["notes"] = notes
+        return result
+
+    def commit_scan(self, scan_id: str) -> dict:
+        if not re.fullmatch(r"[0-9a-f]{12}", scan_id or ""):
+            raise ValueError("invalid scan_id")
+        pending_path = self.snapshots / "pending" / f"{scan_id}.json"
+        if not pending_path.exists():
+            raise ValueError("unknown or already committed scan_id")
+        pending = json.loads(pending_path.read_text("utf-8"))
+        pending["committed_at"] = dates.now_berlin().isoformat(timespec="minutes")
+        target = self.snapshots / f"{pending['target']}.json"
+        target.write_text(json.dumps(pending, ensure_ascii=False), "utf-8")
+        pending_path.unlink()
+        return {"committed": scan_id, "course": pending.get("title"), "baseline_from": pending["scanned_at"]}

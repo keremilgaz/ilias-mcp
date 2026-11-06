@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en"><head><title>ILIAS Universität Konstanz</title></head>
+<body>
+<div class="il-maincontrols-metabar">
+  <a href="login.php?target=&amp;client_id=ILIASKONSTANZ&amp;cmd=force_login&amp;lang=en">Log In</a>
+</div>
+<main class="il-layout-page-content">
+  <p>Please login with your university account (name.surname)</p>
+  <form role="form" class="il-standard-form form-horizontal" enctype="multipart/form-data"
+        action="ilias.php?baseClass=ilStartUpGUI&amp;cmd=post&amp;fallbackCmd=doStandardAuthentication&amp;lang=en&amp;client_id=ILIASKONSTANZ"
+        method="post" novalidate="novalidate">
+    <input type="text" id="il_ui_fw_1" value="" name="login_form/input_3/input_4" class="form-control"/>
+    <input type="password" id="il_ui_fw_2" value="" name="login_form/input_3/input_5" class="form-control"/>
+    <button class="btn btn-default" data-action="">Log In</button>
+  </form>
+</main>
+</body></html>
