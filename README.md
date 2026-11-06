@@ -1,148 +1,215 @@
 # ilias-mcp
 
-A **read-only** [Model Context Protocol](https://modelcontextprotocol.io) server
-for the ILIAS learning platform of the University of Konstanz. It lets an MCP
-client such as the Claude desktop app list your courses, folders, assignments,
-forum topics and news, read course files, and report what changed since the
-last check — without being able to change anything on ILIAS.
+**Ask your AI assistant about your ILIAS courses.**
 
-Built and tested against ILIAS 10 at `ilias.uni-konstanz.de` (German and
-English UI). Other ILIAS 8–10 installations with a local login form should
-work after setting `ILIAS_BASE_URL` and `ILIAS_CLIENT_ID`; Shibboleth-only
-logins are not supported.
+Find course materials, check assignment deadlines, and catch up on what changed
+since your last saved check, all from your AI chat.
 
-## Read-only is enforced, not promised
+An independent student project for the **University of Konstanz**. Connect
+Claude to the course content you can access with your own ILIAS account.
+Access is read-only: there are no tools for submitting assignments, posting
+messages, or joining courses.
 
-Every HTTP request, including each redirect hop, passes through
-[`policy.py`](src/ilias_mcp/policy.py) before it leaves the machine:
+## What can I ask?
 
-| Rule | Why |
-|---|---|
-| `GET` only; a single `POST` is allowed for the login form, only during login and only to that exact URL | nothing can be submitted |
-| No `rtoken` parameter | ILIAS attaches this CSRF token to links whose GET changes state (remove favourite, mark as read, leave, ...) |
-| `cmd` / `fallbackCmd` must be on an allowlist of viewing commands | some state-changing GETs carry no `rtoken` (e.g. `setPdModeEvents` in the calendar block); unknown commands are refused and named, so a new safe one is added deliberately |
-| No `thr_pk` / `pos_pk` | opening a forum thread marks its posts as read |
-| No mail GUI | opening a mail marks it as read |
-| Permanent links only in their plain `type/id` form | `goto` targets can carry suffixes such as registration codes that join a course |
-| Same host, `https`, known entry points only | nothing slips through redirects |
+- “What assignments are due this week in my courses?”
+- “What has changed in this course since my last check?”
+- “Find the latest lecture slides and summarize them for me.”
+- “Show me the announcements and forum topics for this course.”
 
-There are no tools for submitting, posting, joining or team management.
-Requests are spaced at least one second apart and every tool call has a
-request budget. A rejected password is not retried, to avoid an account
-lockout. The password is read from the macOS Keychain and never written to a
-file, log or error message.
+The assistant retrieves information through ilias-mcp and uses it to answer
+your question.
 
-## Tools
+## Get started on macOS
 
-| Tool | Returns |
-|---|---|
-| `ilias_list_courses` | courses and groups on the dashboard, grouped by semester |
-| `ilias_list_items` | objects in a course/folder/session (type, ref_id, file version/date/size), optionally recursive |
-| `ilias_list_assignments` | an exercise's assignments ("show all" view): deadline, start, submission status, files |
-| `ilias_read_file` | text of PDF/PPTX/DOCX/text/ZIP files, per page or as keyword snippets; remembers what was read |
-| `ilias_list_forum_topics` | the thread list with post counts and last activity; threads are never opened |
-| `ilias_list_news` | dashboard or course news |
-| `ilias_page_text` | readable text of any page (announcements, schedules), as a fallback |
-| `ilias_scan` / `ilias_commit_scan` | new/changed/removed files, assignments, threads and page text since the last committed scan |
-| `ilias_download_file` | save a file below `ILIAS_DOWNLOAD_ROOT`, never overwriting |
-| `ilias_status` | configuration, login state, request counter and the active policy |
+You will need:
 
-**Read record.** `ilias_read_file` keeps, per file and content hash, the pages
-already returned. An unchanged, fully read file comes back as `already_read`
-unless specific pages are requested, so the same PDF is not re-read every
-week; a new upload is detected and read again.
+- The **Claude desktop app** and your **ILIAS login**.
+- **Git** and **Python 3.10+** installed. The script can also use `uv`.
 
-**Change detection.** `ilias_scan` crawls one course and compares it with the
-last *committed* snapshot. Commit only after the findings are recorded, so a
-failed run never swallows changes. Forum unread counts are deliberately left
-out of the comparison: reading a thread in the browser is not news.
-
-## Setup (macOS)
+Open Terminal and run:
 
 ```bash
-git clone <this repository> ~/Projects/ilias-mcp
-cd ~/Projects/ilias-mcp
-bash setup.sh            # or: bash setup.sh --skip-check
+git clone https://github.com/keremilgaz/ilias-mcp.git
+cd ilias-mcp
+bash setup.sh
 ```
 
-The script
+Follow the prompts to install the program, save your password in macOS
+Keychain, and check the connection. The check opens two of your courses.
+Choose a download folder and answer **y** when asked to add ilias-mcp to
+Claude. Your existing configuration is backed up first.
 
-1. creates `.venv` and installs the package (Python 3.10+),
-2. asks for your ILIAS username and stores the password in the Keychain
-   (`security add-generic-password -w` prompts for it, so it never appears on
-   screen or in the shell history),
-3. runs a self-test (`ilias-mcp-check`: log in, open two courses),
-4. optionally adds the server to `claude_desktop_config.json` (with a backup):
+Quit Claude completely with **Cmd+Q**, open it again, and try:
+
+> List my courses on ILIAS.
+
+## How does it work?
+
+The program runs on your computer and retrieves ILIAS pages or files when
+your assistant asks for them. It saves previous checks locally so later
+scans can report changes. Checks run on request; there are no automatic
+background notifications.
+
+**MCP** stands for [Model Context Protocol](https://modelcontextprotocol.io).
+It lets compatible AI apps use tools like this one. Manual configuration for
+other MCP clients is included below.
+
+## Your account and course data
+
+- Your password stays in **macOS Keychain**, outside the AI configuration.
+- Saved checks and extracted file text are cached on your computer.
+- Retrieved content is shared with your **AI application** and may reach its
+  cloud model provider. Local installation does not make the AI processing local.
+
+## Current scope
+
+An early release for Konstanz's ILIAS 10, with German and English support.
+Other installations may need adaptation; Shibboleth/SSO login is unsupported.
+It reads text from PDF, PowerPoint, Word, text files, and ZIP archives. Scanned
+images need OCR, which is not included. Forum access covers topic lists.
+
+## Technical reference
+
+<details>
+<summary><strong>Configuration and manual setup</strong></summary>
+
+The setup script creates this entry in `claude_desktop_config.json`. For
+manual setup, replace the example paths and username with your own:
 
 ```json
 {
   "mcpServers": {
     "ilias": {
       "command": "/Users/<you>/Projects/ilias-mcp/.venv/bin/ilias-mcp",
-      "env": { "ILIAS_USER": "firstname.lastname", "ILIAS_DOWNLOAD_ROOT": "/Users/<you>/Documents/ILIAS" }
+      "env": {
+        "ILIAS_USER": "firstname.lastname",
+        "ILIAS_DOWNLOAD_ROOT": "/Users/<you>/Documents/ILIAS"
+      }
     }
   }
 }
 ```
 
-Restart the Claude app afterwards. Then ask, for example: *"Scan my Scientific
-Practices course on ILIAS and list the upcoming deadlines."*
-
-### Configuration
+If setup reports a failed connection check, inspect `selftest-report.json`.
+To skip that check when running setup again, use `bash setup.sh --skip-check`.
 
 | Variable | Default |
 |---|---|
-| `ILIAS_USER` | required |
+| `ILIAS_USER` | Required |
 | `ILIAS_BASE_URL` | `https://ilias.uni-konstanz.de` |
 | `ILIAS_CLIENT_ID` | `ILIASKONSTANZ` |
-| `ILIAS_LANG` | `en` (the UI language of the session follows your ILIAS profile) |
-| `ILIAS_MIN_INTERVAL` | `1.0` seconds between requests (minimum 0.5) |
-| `ILIAS_MAX_REQUESTS_PER_CALL` | `60` (`ilias_scan` uses 120) |
+| `ILIAS_LANG` | `en`; the session UI language follows your ILIAS profile |
+| `ILIAS_MIN_INTERVAL` | `1.0` seconds between requests; minimum `0.5` |
+| `ILIAS_MAX_REQUESTS_PER_CALL` | `60`; `ilias_scan` uses `120` |
+| `ILIAS_TIMEOUT` | `30.0` seconds |
 | `ILIAS_KEYCHAIN_SERVICE` | `ilias-mcp` |
-| `ILIAS_CACHE_DIR` | `~/Library/Caches/ilias-mcp` (read record, snapshots, extracted text) |
+| `ILIAS_CACHE_DIR` | `~/Library/Caches/ilias-mcp` on macOS |
 | `ILIAS_DOWNLOAD_ROOT` | `~/Documents/ILIAS` |
 
-## Project layout
+</details>
 
-```
+<details>
+<summary><strong>Available tools and saved state</strong></summary>
+
+| Tool | Returns |
+|---|---|
+| `ilias_list_courses` | Courses and groups on the dashboard, with semester sections |
+| `ilias_list_items` | Course, folder, or session contents and file metadata; optionally recursive |
+| `ilias_list_assignments` | Assignment deadlines, start dates, submission status, and files |
+| `ilias_read_file` | Extracted file text, selected pages, or keyword snippets |
+| `ilias_list_forum_topics` | Thread titles, post counts, and last activity; does not open threads |
+| `ilias_list_news` | Dashboard or course news |
+| `ilias_page_text` | Readable page text as a fallback for announcements or schedules |
+| `ilias_scan` | New, changed, and removed items compared with the saved course state |
+| `ilias_commit_scan` | Saves a scan as the reference for the next comparison |
+| `ilias_download_file` | Saves a file under the configured download folder without replacing a different file |
+| `ilias_status` | Configuration, login state, request counter, and request policy |
+
+**Reading records.** `ilias_read_file` tracks returned pages by file ID and
+content hash. An unchanged, fully read version returns `already_read`.
+Request specific `pages`, use a keyword `query`, or set `force=true` to read
+it again. “Read” means the text was returned by the tool, not that the user
+has read it. Records and extracted text are stored under `files/` in the
+cache directory.
+
+**Change detection.** `ilias_scan` compares one course with its last committed
+snapshot, then saves a pending snapshot and returns a `scan_id`. Calling
+`ilias_commit_scan` with that ID replaces the course's comparison baseline.
+The first scan treats all items as new. An inaccessible folder can cause an
+existing item to appear as removed, so check unexpected removals in ILIAS
+and review incomplete scans before committing them. Forum unread counts are
+excluded from the comparison. Snapshots are stored under `snapshots/` in the
+cache directory. Clearing the cache resets the saved history.
+
+</details>
+
+<details>
+<summary><strong>Request policy, code layout, and development</strong></summary>
+
+Every outgoing HTTP request, including redirects, is checked by
+[`policy.py`](src/ilias_mcp/policy.py). Requests are paced at one per second
+by default, with a budget per tool call. A rejected password is not
+automatically retried.
+
+| Check | Purpose |
+|---|---|
+| `GET` requests, with a login-only `POST` exception | Restricts form submissions to the login flow |
+| Reject `rtoken` parameters | Blocks links carrying ILIAS action tokens |
+| Allowlisted `cmd` / `fallbackCmd` values | Rejects unknown commands, including actions without an `rtoken` |
+| Reject `thr_pk`, `pos_pk`, and the mail GUI | Avoids opening threads or mail that can mark content as read |
+| Plain permanent-link targets only | Rejects registration-code links and other action suffixes |
+| HTTPS, configured host, and known entry points | Restricts destinations, including redirect hops |
+
+The code separates ILIAS access from the MCP interface:
+
+```text
 src/ilias_mcp/
-  policy.py       the read-only request policy
-  client.py       HTTP client: guarded transport, rate limit, request budget, login and re-login
-  credentials.py  Keychain lookup
-  parsers.py      HTML -> data (container lists, assignments, forum, news, page text); hot-reloaded
-  dates.py        German/English ILIAS dates -> ISO 8601 (Europe/Berlin)
-  files.py        text extraction (pypdf, PPTX/DOCX via zipfile) and the read record
-  service.py      the operations behind the tools (crawl, scan, read, download)
-  server.py       MCP wiring (stdio)
-  check.py        ilias-mcp-check self-test
-tests/            pytest suite against a fake ILIAS (httpx.MockTransport) and HTML fixtures
+  policy.py       Request checks
+  client.py       HTTP requests, login, sessions, rate limits, and budgets
+  credentials.py  Keychain access
+  parsers.py      HTML parsing
+  dates.py        German/English dates in Europe/Berlin
+  files.py        Text extraction and reading records
+  service.py      Course scanning, comparisons, reading, and downloads
+  server.py       MCP tools over stdio
+  check.py        Live connection self-test
+tests/           Fake ILIAS server and HTML fixtures
 ```
 
-## Development
+To run the development tests:
 
 ```bash
 .venv/bin/pip install -e ".[dev]"
 .venv/bin/pytest
 ```
 
-The tests cover the policy, login and re-login, redirects into blocked URLs,
-rate limiting, parsing, the read record, change detection and the MCP layer.
-`ilias-mcp-check --dump DIR` saves the pages it fetched (with `rtoken` and
-hidden form values blanked) to adapt the parsers to real markup; the running
-server reloads `parsers.py` and `dates.py` when they change, so parser fixes
-need no restart.
+Tests use `httpx.MockTransport` and HTML fixtures. They cover request checks,
+login and re-login, redirects, rate limits, parsing, reading records, change
+detection, and MCP tool calls.
 
-## Responsible use
+For live parser debugging, `ilias-mcp-check --dump DIR` saves fetched pages
+and attempts to redact action tokens and hidden form values. These pages
+and the self-test report can still contain private course information; they
+are excluded from Git by default when using the setup script's output paths.
+The running server reloads `parsers.py` and `dates.py` when they change.
 
-This is a personal client for your own account. The University of Konstanz
-ILIAS `robots.txt` asks automated crawlers to stay away; this tool is not a
-crawler of the site, but it is automated, so keep the request rate low, scan
-one course at a time and check your university's terms of use. Course
-material is for your own study: do not republish it.
+</details>
+
+## Feedback and contributions
+
+If you try it, feedback on setup, missing information, or a useful study
+workflow is welcome. Open an
+[issue](https://github.com/keremilgaz/ilias-mcp/issues) with what you expected
+and what happened. Remove account details and private course content from
+anything you share.
+
+Use the tool with your own account, keep scans focused on your courses, and
+follow your university's rules for automated access and course materials.
+
+## Acknowledgements and license
 
 Selector knowledge comes from [PFERD](https://github.com/Garmelon/PFERD) and
 [ilias-mcp (Stuttgart)](https://github.com/DenizAltunkapan/ilias-mcp).
 
-## License
-
-[MIT](LICENSE)
+Licensed under [MIT](LICENSE).

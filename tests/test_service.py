@@ -126,3 +126,14 @@ def test_download_stays_inside_root(service: IliasService, fake, settings) -> No
         service.download_file("2131745", "/tmp/elsewhere")
     with pytest.raises(ValueError):
         service.download_file("2131745", "../../escape")
+
+
+def test_incomplete_scan_is_flagged(service: IliasService, fake) -> None:
+    baseline = service.scan("crs/2125765", depth=1)
+    assert "incomplete" not in baseline
+    service.commit_scan(baseline["scan_id"])
+    del fake.ref_pages["2131737"]  # the folder now fails to load
+    later = service.scan("crs/2125765", depth=1)
+    assert later["incomplete"] is True
+    assert any("Lecture Content" in n for n in later["notes"])
+    assert "item:2131770" in {r["key"] for r in later["removed"]}  # why the warning matters

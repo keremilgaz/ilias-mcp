@@ -431,8 +431,15 @@ class IliasService:
             result["note"] = "first scan of this course: everything is listed as new"
         if crawl.get("truncated"):
             notes.append(crawl["truncated"])
+        notes.extend(f"could not open {e}" for e in crawl.get("errors", []))
         if notes:
             result["notes"] = notes
+            # Parts of the course were not read, so "removed" may be wrong.
+            result["incomplete"] = True
+            result["warning"] = (
+                "incomplete scan: items under the parts listed in 'notes' may show up as "
+                "removed. Check before committing."
+            )
         return result
 
     def commit_scan(self, scan_id: str) -> dict:
