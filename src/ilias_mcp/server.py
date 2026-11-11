@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import functools
 import importlib
 import logging
@@ -18,7 +19,7 @@ from mcp.types import ToolAnnotations
 
 from . import __version__, dates, parsers
 from .client import BudgetExceeded, IliasClient, IliasError, LoginError
-from .config import Settings, load_settings, prepare_cache
+from .config import ConfigError, Settings, load_settings, prepare_cache
 from .credentials import CredentialError
 from .files import FileCache
 from .policy import PolicyViolation
@@ -47,6 +48,7 @@ mcp = MCPServer(name="ilias", version=__version__, instructions=INSTRUCTIONS)
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
 
 _service: IliasService | None = None
+_service_lock = threading.Lock()
 _settings: Settings | None = None
 _mtimes: dict[str, float] = {}
 
@@ -59,11 +61,12 @@ def configure(service: IliasService) -> None:
 
 def get_service() -> IliasService:
     global _service, _settings
-    if _service is None:
-        _settings = load_settings()
-        client = IliasClient(_settings)
-        _service = IliasService(_settings, client, FileCache(prepare_cache(_settings) / "files"))
-    return _service
+    with _service_lock:
+        if _service is None:
+            _settings = load_settings()
+            client = IliasClient(_settings)
+            _service = IliasService(_settings, client, FileCache(prepare_cache(_settings) / "files"))
+        return _service
 
 
 def _reload_parsers() -> None:
@@ -85,11 +88,13 @@ def _tool(limit: int | None = None) -> Callable:
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> dict:
             def work() -> dict:
-                service = get_service()
-                _reload_parsers()
                 try:
+                    service = get_service()
+                    _reload_parsers()
                     with service.client.call_scope(limit):
                         return fn(service, *args, **kwargs)
+                except ConfigError as exc:
+                    return {"error": str(exc)}
                 except PolicyViolation as exc:
                     return {"error": f"blocked by the read-only policy: {exc}"}
                 except (LoginError, CredentialError) as exc:
@@ -272,7 +277,10 @@ async def ilias_check_all(
 
     def work() -> dict:
         global _job
-        service = get_service()
+        try:
+            service = get_service()
+        except ConfigError as exc:
+            return {"error": str(exc)}
         with _job_lock:
             job = _job
             if job is None or job["collected"]:
@@ -309,14 +317,21 @@ def ilias_download_file(service: IliasService, target: str, dest_dir: str) -> di
     return service.download_file(target, dest_dir)
 
 
-def main() -> None:
+def main(*, require_account: bool = True) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=__version__)
+    parser.parse_args()
     logging.basicConfig(
         stream=sys.stderr,  # stdout carries the MCP protocol
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    get_service()  # fail fast on missing ILIAS_USER
+    if require_account:
+        try:
+            get_service()
+        except (ConfigError, ValueError) as exc:
+            sys.exit(str(exc))
     mcp.run("stdio")
 
 

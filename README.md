@@ -6,7 +6,7 @@ Find course materials, check assignment deadlines, and catch up on what changed
 since your last saved check, all from your AI chat.
 
 An independent student project for the **University of Konstanz**. Connect
-Claude to the course content you can access with your own ILIAS account.
+your MCP client to the course content you can access with your own ILIAS account.
 Access is read-only: there are no tools for submitting assignments, posting
 messages, or joining courses.
 
@@ -20,49 +20,101 @@ messages, or joining courses.
 The assistant retrieves information through ilias-mcp and uses it to answer
 your question.
 
-## Get started on macOS
+## Install in Claude Desktop
 
-You will need:
+1. Download `ilias-mcp-<version>.mcpb` from [GitHub Releases](https://github.com/keremilgaz/ilias-mcp/releases).
+2. In Claude Desktop, go to **Settings → Desktop app → Manage Extensions → Advanced settings → Install Extension** and select the bundle.
+3. In a Claude chat, say **Open ILIAS setup**. Enter your credentials in the local browser form, then ask Claude to list your courses.
 
-- The **Claude desktop app** and your **ILIAS login**.
-- **Git** and **Python 3.10+** installed. The script can also use `uv`.
+Claude Desktop manages Python and the dependencies on the first launch. If you
+already saved your account with the setup script, you can ask for your courses
+right away. When switching from a manual installation, disable the old ILIAS
+entry in Claude Desktop so you see a single set of tools.
+[Claude Desktop extension instructions](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop)
 
-Open Terminal and run:
+On Linux, have an unlocked Secret Service keyring in the same user session.
+After changing a previously used account or password, restart Claude Desktop.
+
+## Connect in ChatGPT
+
+1. Create or find a tunnel in [OpenAI Platform](https://platform.openai.com/settings/organization/tunnels), associate it with your ChatGPT workspace, and create a runtime API key with **Tunnels Read + Use**. Download and extract the [official tunnel-client](https://github.com/openai/tunnel-client/releases/latest) for your system.
+2. Run the command for your system from the extracted ILIAS source archive or repository. If `tunnel-client` is on your `PATH`, omit the executable path argument.
+
+   **macOS and Linux**
+
+   ```bash
+   bash setup.sh --chatgpt --tunnel-client /path/to/tunnel-client
+   ```
+
+   **Windows**
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File setup.ps1 -ChatGPT -TunnelClient "C:\path\to\tunnel-client.exe"
+   ```
+
+3. Enter the tunnel ID and runtime key when prompted. If your ILIAS account needs setup, the browser form opens. Keep the terminal running.
+4. Open [ChatGPT Plugins](https://chatgpt.com/plugins), choose **Add custom MCP server → Tunnel**, and select your tunnel ID. Choose **No authentication** for the MCP server and install it as a personal plugin for your ILIAS account. In a chat, select it using `@` and ask for your courses.
+
+If you installed the wheel, use `ilias-mcp-chatgpt` directly. The launcher
+also reads `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` when set.
+Access depends on your OpenAI account and workspace permissions.
+[Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) · [Add a custom MCP server](https://developers.openai.com/api/docs/guides/custom-mcp-server)
+
+## Install from source
+
+You need your **ILIAS login** and **Python 3.10+** or [uv](https://docs.astral.sh/uv/getting-started/installation/).
+Download and extract the source archive from [GitHub Releases](https://github.com/keremilgaz/ilias-mcp/releases)
+or clone this repository with Git.
 
 ```bash
 git clone https://github.com/keremilgaz/ilias-mcp.git
 cd ilias-mcp
+```
+
+From the extracted or cloned directory, run the command for your system.
+
+**macOS and Linux**
+
+```bash
 bash setup.sh
 ```
 
-Follow the prompts to install the program, save your password in macOS
-Keychain, and check the connection. The check opens two of your courses.
-Choose a download folder and answer **y** when asked to add ilias-mcp to
-Claude. Your existing configuration is backed up first.
+On Debian and Ubuntu, install `python3-venv` if your Python installation is
+missing it. Linux also needs an unlocked Secret Service keyring in the same
+user session, such as GNOME Keyring. For Claude on Windows, run the Windows
+installer from PowerShell so the MCP server uses Windows Credential Manager.
 
-Quit Claude completely with **Cmd+Q**, open it again, and try:
-
-> List my courses on ILIAS.
-
-## Get started on Windows
-
-You will need the same: the **Claude desktop app**, your **ILIAS login**,
-**Git**, and **Python 3.10+** from [python.org](https://www.python.org/downloads/)
-(or `winget install Python.Python.3.12`).
-
-Open PowerShell and run:
+**Windows**
 
 ```powershell
-git clone https://github.com/keremilgaz/ilias-mcp.git
-cd ilias-mcp
 powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
 
-The prompts are the same as on macOS; your password is saved in **Windows
-Credential Manager**. `-ExecutionPolicy Bypass` applies to this one run only.
-Then quit Claude from its tray icon (closing the window is not enough), open
-it again, and try the same question. Windows support is new: if something
-fails, please open an issue.
+The installer opens a local browser page. Enter your ILIAS username and
+password, then select **Save account**. Setup checks the login with ILIAS,
+stores the password in your system credential store, and adds the server to
+Claude Desktop. If the browser does not open, copy the address from the
+terminal. If the password is already stored, leave the password field blank.
+Rerun the same setup command whenever your password changes.
+
+Quit Claude Desktop completely and reopen it. On Windows, quit from the
+system tray. Try asking Claude to list your courses.
+
+> List my courses on ILIAS.
+
+Claude Desktop is available on [macOS, Windows and Linux (beta)](https://support.claude.com/en/articles/10065433-install-claude-desktop).
+Use `--terminal` (PowerShell: `-Terminal`) to enter your credentials in the
+terminal instead. Use `--skip-check` (PowerShell: `-SkipCheck`) when ILIAS is
+temporarily unreachable.
+
+### Other MCP clients
+
+Add `--no-claude` (PowerShell: `-NoClaude`) to save the account and print the
+local MCP command without changing Claude settings. An installed wheel exposes
+the same setup as `ilias-mcp-config setup`.
+
+In a compatible local MCP client, configure the printed command as a stdio
+server.
 
 ## How does it work?
 
@@ -77,8 +129,9 @@ other MCP clients is included below.
 
 ## Your account and course data
 
-- Your password stays in **macOS Keychain** or **Windows Credential Manager**,
-  outside the AI configuration.
+- Your password is saved in **macOS Keychain**, **Windows Credential Manager**
+  or a **Linux Secret Service** keyring. The local setup profile stores your
+  username and any custom download folder.
 - Saved checks and extracted file text are cached on your computer.
 - Retrieved content is shared with your **AI application** and may reach its
   cloud model provider. Local installation does not make the AI processing local.
@@ -121,19 +174,20 @@ run from the virtualenv, prints the exact entry for your computer; without
 |---|---|
 | macOS | `~/Library/Application Support/Claude/` |
 | Windows | `%APPDATA%\Claude\`; Microsoft Store version: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/Claude/` |
 
-On Windows and Linux the password is read through
-[`keyring`](https://pypi.org/project/keyring/); save it with
-`.venv\Scripts\python -m keyring set ilias-mcp firstname.lastname`
-(Linux: `.venv/bin/python`). Linux needs a running Secret Service such as GNOME Keyring.
+If you prefer to configure the credentials and client separately, run
+`ilias-mcp-config setup --no-claude` from your virtual environment.
+The optional `--download-root DIR` (PowerShell: `-DownloadRoot DIR`) sets
+where downloaded files can be saved.
 
-If setup reports a failed connection check, inspect `selftest-report.json`.
-To skip that check when running setup again, use `bash setup.sh --skip-check`
-(Windows: `setup.ps1 -SkipCheck`).
+For a full diagnostic with your saved account, run `ilias-mcp-check`. It opens
+two courses by default and writes `selftest-report.json`. Add `--dump DIR` only
+when you need HTML for debugging.
 
 | Variable | Default |
 |---|---|
-| `ILIAS_USER` | Required |
+| `ILIAS_USER` | Username saved by setup; this variable overrides it |
 | `ILIAS_BASE_URL` | `https://ilias.uni-konstanz.de` |
 | `ILIAS_CLIENT_ID` | `ILIASKONSTANZ` |
 | `ILIAS_LANG` | `en`; the session UI language follows your ILIAS profile |
@@ -141,8 +195,8 @@ To skip that check when running setup again, use `bash setup.sh --skip-check`
 | `ILIAS_MAX_REQUESTS_PER_CALL` | `60`; `ilias_scan` uses `120`, `ilias_check_all` `400` |
 | `ILIAS_TIMEOUT` | `30.0` seconds |
 | `ILIAS_KEYCHAIN_SERVICE` | `ilias-mcp` |
-| `ILIAS_CACHE_DIR` | `~/Library/Caches/ilias-mcp` on macOS, `%LOCALAPPDATA%\ilias-mcp\Cache` on Windows |
-| `ILIAS_DOWNLOAD_ROOT` | `~/Documents/ILIAS` |
+| `ILIAS_CACHE_DIR` | `~/Library/Caches/ilias-mcp` on macOS, `%LOCALAPPDATA%\ilias-mcp\Cache` on Windows, `${XDG_CACHE_HOME:-~/.cache}/ilias-mcp` on Linux |
+| `ILIAS_DOWNLOAD_ROOT` | The configured folder, or `ILIAS` inside your system Documents folder |
 
 </details>
 
@@ -186,12 +240,10 @@ from the comparison. `ilias_check_all` compares news with the last check that
 could read the news page, so a check without it does not skip any news.
 
 **Cache.** Reading records, extracted text, snapshots and learned routes are
-kept per ILIAS installation and account, under `accounts/` in the cache
-directory, so two accounts on one computer never share them. A cache from
-version 0.2 or older does not record its account, so it is not used until you
-say whose it is: the setup script asks, or run
-`ilias-mcp-config cache --user firstname.lastname --adopt`. Clearing the cache
-resets the saved history.
+kept per ILIAS installation and account under `accounts/` in the cache
+directory. To import a cache from version 0.2 or older, identify the account
+it belongs to with `ilias-mcp-config cache --user firstname.lastname --adopt`.
+Clearing the cache resets the saved history.
 
 </details>
 
@@ -210,7 +262,7 @@ automatically retried.
 | Allowlisted `cmd` / `fallbackCmd` values | Rejects unknown commands, including actions without an `rtoken` |
 | Reject `thr_pk`, `pos_pk`, and the mail GUI | Avoids opening threads or mail that can mark content as read |
 | Plain permanent-link targets only | Rejects registration-code links and other action suffixes |
-| HTTPS, configured host, and known entry points | Restricts destinations, including redirect hops |
+| HTTPS, configured host and port, and known entry points | Restricts destinations, including redirect hops |
 
 The code separates ILIAS access from the MCP interface:
 
@@ -218,14 +270,16 @@ The code separates ILIAS access from the MCP interface:
 src/ilias_mcp/
   policy.py       Request checks
   client.py       HTTP requests, login, sessions, rate limits, and budgets
-  credentials.py  Keychain / Credential Manager access
+  credentials.py  system credential store access
   parsers.py      HTML parsing
   dates.py        German/English dates in Europe/Berlin
   files.py        Text extraction and reading records
   service.py      Course scanning, comparisons, reading, and downloads
   server.py       MCP tools over stdio
   check.py        Live connection self-test
-  install.py      Claude configuration (ilias-mcp-config)
+  install.py      account setup and Claude configuration (ilias-mcp-config)
+  chatgpt.py      Secure MCP Tunnel launcher (ilias-mcp-chatgpt)
+  setup_web.py    local browser form for account setup
 tests/           Fake ILIAS server and HTML fixtures
 ```
 
@@ -236,7 +290,8 @@ To run the development tests:
 .venv/bin/pytest
 ```
 
-On Windows, use `.venv\Scripts\pip` and `.venv\Scripts\pytest`.
+On Windows, use `.venv\Scripts\pip` and `.venv\Scripts\pytest`. If setup used
+`uv`, use `uv pip install -e ".[dev]"` to install the test dependencies.
 
 Tests use `httpx.MockTransport` and HTML fixtures. They cover request checks,
 login and re-login, redirects, rate limits, parsing, reading records, change
@@ -244,8 +299,9 @@ detection, and MCP tool calls.
 
 For live parser debugging, `ilias-mcp-check --dump DIR` saves fetched pages
 and attempts to redact action tokens and hidden form values. These pages
-and the self-test report can still contain private course information; they
-are excluded from Git by default when using the setup script's output paths.
+and the self-test report can still contain private course information.
+Use `.debug/pages` for dumps to keep them out of Git along with the default
+`selftest-report.json`.
 The running server reloads `parsers.py` and `dates.py` when they change.
 
 </details>
@@ -267,3 +323,23 @@ Selector knowledge comes from [PFERD](https://github.com/Garmelon/PFERD) and
 [ilias-mcp (Stuttgart)](https://github.com/DenizAltunkapan/ilias-mcp).
 
 Licensed under [MIT](LICENSE).
+
+
+## Versions and releases
+
+Check the installed version with `ilias-mcp --version`. The package, command-line
+tools and MCP server share the version in `src/ilias_mcp/__init__.py`.
+
+For maintainers, update that file using [Semantic Versioning](https://semver.org/),
+then commit the change and push the matching `vMAJOR.MINOR.PATCH` tag.
+
+```bash
+git tag -a v0.4.0 -m "Release 0.4.0"
+git push origin v0.4.0
+```
+
+The release workflow checks the tag against the package version, runs the test
+matrix on Windows, macOS and Linux, then attaches the Claude `.mcpb`, wheel,
+and source package to a GitHub Release. Build the bundle locally with
+`python scripts/build_mcpb.py`. To upgrade, install the new bundle or update
+your source checkout and rerun setup. Your existing password can be reused.

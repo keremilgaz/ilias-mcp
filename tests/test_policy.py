@@ -86,3 +86,13 @@ def test_login_post_only_inside_window_and_only_that_url(policy: ReadOnlyPolicy)
             policy.check("POST", f"{B}/ilias.php?baseClass=ilExSubmissionGUI&cmd=post&ref_id=1")
     with pytest.raises(PolicyViolation):
         policy.check("POST", LOGIN_POST)
+
+
+def test_policy_limits_login_and_reads_to_the_configured_port() -> None:
+    policy = ReadOnlyPolicy("ilias.uni-konstanz.de:8443")
+    endpoint = LOGIN_POST.replace(B, f"{B}:8443")
+    policy.check("GET", f"{B}:8443/login.php")
+    with policy.login_window(endpoint):
+        policy.check("POST", endpoint)
+        with pytest.raises(PolicyViolation, match="port"):
+            policy.check("POST", LOGIN_POST)

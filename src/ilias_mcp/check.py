@@ -17,7 +17,7 @@ from pathlib import Path
 
 from . import __version__, parsers
 from .client import IliasClient
-from .config import load_settings, prepare_cache
+from .config import ConfigError, load_settings, prepare_cache
 from .files import FileCache
 from .service import IliasService
 
@@ -30,6 +30,7 @@ def _redact(html: str) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--version", action="version", version=__version__)
     ap.add_argument("--report", default="selftest-report.json")
     ap.add_argument("--dump", metavar="DIR", help="save redacted HTML of the pages fetched")
     ap.add_argument("--courses", type=int, default=2, help="how many courses to open (default 2)")
@@ -37,7 +38,10 @@ def main() -> None:
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except (ConfigError, ValueError) as exc:
+        sys.exit(str(exc))
     client = IliasClient(settings)
     service = IliasService(settings, client, FileCache(prepare_cache(settings) / "files"))
     report: dict = {"version": __version__, "base_url": settings.base_url, "steps": []}

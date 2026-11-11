@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ilias-mcp"
-version = "0.3.1"
+dynamic = ["version"]
 description = "Read-only MCP server for ILIAS (University of Konstanz)"
 readme = "README.md"
 license = "MIT"
@@ -17,9 +17,9 @@ dependencies = [
     "httpx>=0.27,<1",
     "beautifulsoup4>=4.12",
     "pypdf>=5.0",
-    # macOS uses the built-in Keychain tool; elsewhere the password is read via keyring
-    # (Windows Credential Manager, Linux Secret Service).
+    "pyobjc-framework-Security>=10; sys_platform == 'darwin'",
     "keyring>=25; sys_platform != 'darwin'",
+    "platformdirs>=4",
     # Windows has no system time zone database for zoneinfo.
     "tzdata; sys_platform == 'win32'",
 ]
@@ -31,9 +31,13 @@ dev = ["pytest>=8", "reportlab>=4"]
 ilias-mcp = "ilias_mcp.server:main"
 ilias-mcp-check = "ilias_mcp.check:main"
 ilias-mcp-config = "ilias_mcp.install:main"
+ilias-mcp-chatgpt = "ilias_mcp.chatgpt:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ilias_mcp.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
