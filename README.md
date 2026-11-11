@@ -1,5 +1,7 @@
 # ilias-mcp
 
+**English** · [Türkçe](README.tr.md) · [Deutsch](README.de.md)
+
 **Ask your AI assistant about your ILIAS courses.**
 
 Find course materials, check assignment deadlines, and catch up on what changed
@@ -19,6 +21,66 @@ messages, or joining courses.
 
 The assistant retrieves information through ilias-mcp and uses it to answer
 your question.
+
+## Usage scenarios
+
+**Weekly check.** Once a week, ask:
+
+> Check all my ILIAS courses for this semester and tell me what is new since my last check.
+
+The assistant checks every course of the current semester in one go. It
+reports only new or changed files, assignments, forum topics and
+announcements, plus deadlines in the next 14 days. After you have noted what
+matters, it saves the check, so next week's check starts from there. The very
+first check lists everything as new.
+
+**Deadlines at a glance.**
+
+> List all open assignments with their deadlines, sorted by date, and mark the ones due this week.
+
+It reads the exercise pages of your courses: deadlines, start dates and
+whether you have already handed something in. If your assistant is also
+connected to a calendar or to-do app, it can carry the dates over there.
+
+**Preparing for a lecture.**
+
+> Find the slides for the next Statistics lecture, summarize them and suggest three questions I could ask.
+
+It finds the newest file in the course and works with its text. Pages already
+read are remembered, so a later request returns only what is new.
+
+**Tasks that appear only in PDFs.** Some instructions are only in slides or
+handouts:
+
+> Search this semester's course PDFs for submission, deadline or presentation and list what you find.
+
+A keyword search returns the matching passages with page numbers instead of
+whole documents.
+
+**Catching up after a break.**
+
+> I missed two weeks of the seminar. What changed in the course, and what did the announcements say?
+
+It compares the course with your last saved check, shows new material and
+announcements, and lists active forum topics. Threads are not opened, so
+nothing is marked as read.
+
+**Saving materials to your folder.**
+
+> Download the new slides of this course into my ILIAS folder, under "Statistics".
+
+Files are saved only inside your configured download folder, and a different
+file with the same name is never overwritten.
+
+**Exam preparation.**
+
+> Go through all lecture slides of this course and build a list of topics, with the slides each one appears on.
+
+Files are read one after another; long ones in parts. The reading record keeps
+track of what has been covered, also across conversations.
+
+What it does not do: submit assignments, write in forums, register for
+courses or open forum threads.
 
 ## Install in Claude Desktop
 
