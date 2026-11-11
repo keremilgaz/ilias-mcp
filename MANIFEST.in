@@ -1,0 +1,4 @@
+include setup.sh setup.ps1
+include scripts/build_mcpb.py
+recursive-include packaging/claude *.json *.py
+recursive-include tests *.py *.html

@@ -1,7 +1,8 @@
-"""`ilias-mcp-config`: add the ilias server to the Claude desktop app's configuration.
+"""Set up an ILIAS account and configure Claude Desktop or another MCP client.
 
-Used by setup.sh (macOS) and setup.ps1 (Windows); also works on its own:
+Used by setup.sh (macOS and Linux) and setup.ps1 (Windows):
 
+    ilias-mcp-config setup [--terminal] [--skip-check] [--no-claude]
     ilias-mcp-config add --user firstname.lastname [--download-root DIR] [--config FILE] [--dry-run]
     ilias-mcp-config has-password --user firstname.lastname
     ilias-mcp-config cache --user firstname.lastname [--adopt | --ask]
@@ -17,16 +18,27 @@ version 0.2 or older records no account, so it is used only after `--adopt`
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shutil
 import sys
-import time
+import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
-from .config import adopt_legacy_cache, has_data, legacy_cache, load_settings
-from .credentials import CredentialError, keychain_password, store_hint
+import httpx
+
+from . import __version__
+from .client import IliasClient, IliasError
+from .config import (
+    ConfigError, adopt_legacy_cache, has_data, legacy_cache, load_settings,
+    read_profile, save_profile, write_json,
+)
+from .credentials import CredentialError, keychain_password, save_password
+from .policy import PolicyViolation
+from .setup_web import SetupError, browser_setup
 
 SERVER_NAME = "ilias"
 CONFIG_NAME = "claude_desktop_config.json"
@@ -85,45 +97,41 @@ def server_entry(command: list[str], user: str, download_root: str | None,
     return entry
 
 
-class ConfigError(RuntimeError):
-    pass
-
-
 def merge_config(path: Path, user: str, download_root: str | None, command: list[str],
                  dry_run: bool = False) -> dict:
     """Add or update the server entry in one config file. Returns what happened."""
     data: dict = {}
     if path.exists():
-        text = path.read_text("utf-8-sig").strip()  # Notepad may add a BOM
         try:
+            text = path.read_text("utf-8-sig").strip()  # Notepad may add a BOM
             data = json.loads(text) if text else {}
         except ValueError as exc:
             raise ConfigError(f"{path} is not valid JSON ({exc}); fix or move it, then try again") from None
         if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
             raise ConfigError(f"{path} has an unexpected structure; add the entry by hand (see --dry-run)")
     servers = data.setdefault("mcpServers", {})
-    entry = server_entry(command, user, download_root, servers.get(SERVER_NAME))
+    previous = servers.get(SERVER_NAME, {})
+    if not isinstance(previous, dict) or (previous.get("env") is not None and not isinstance(previous["env"], dict)):
+        raise ConfigError(f"{path} has an invalid {SERVER_NAME!r} entry. Fix or remove that entry and try again.")
+    entry = server_entry(command, user, download_root, previous)
     result: dict = {"path": str(path), "entry": entry}
     if servers.get(SERVER_NAME) == entry:
         return {**result, "status": "unchanged"}
     if dry_run:
         return {**result, "status": "dry_run"}
     if path.exists():
-        backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        backup = path.with_name(f"{path.name}.bak-{datetime.now():%Y%m%d-%H%M%S-%f}")
         shutil.copy2(path, backup)
         result["backup"] = str(backup)
     servers[SERVER_NAME] = entry
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", "utf-8")
-    tmp.replace(path)
+    write_json(path, data)
     return {**result, "status": "updated" if result.get("backup") else "created"}
 
 
 def _add(args: argparse.Namespace) -> int:
     paths = [Path(args.config).expanduser()] if args.config else claude_config_paths()
     command = server_command()
-    root = str(Path(args.download_root).expanduser()) if args.download_root else None
+    root = str(Path(args.download_root).expanduser().absolute()) if args.download_root else None
     failed = False
     for path in paths:
         try:
@@ -145,11 +153,82 @@ def _add(args: argparse.Namespace) -> int:
 def _has_password(args: argparse.Namespace) -> int:
     try:
         keychain_password(args.service, args.user)
-    except CredentialError:
-        print(f"   No saved password yet. Save it with: {store_hint(args.service, args.user)}")
+    except CredentialError as exc:
+        print(f"   {exc}")
         return 1
     print("   A saved password exists.")
     return 0
+
+
+def _save_account(username: str, password: str, download_root: str | None, verify: bool) -> None:
+    if not username or any(ord(char) < 32 or ord(char) == 127 for char in username):
+        raise SetupError("Enter a valid ILIAS username.")
+    try:
+        settings = load_settings(username)
+        candidate = password or keychain_password(settings.keychain_service, username)
+        if verify:
+            client = IliasClient(settings, password_provider=lambda: candidate)
+            try:
+                client.login()
+            finally:
+                client.close()
+        if password:
+            save_password(settings.keychain_service, username, candidate)
+        save_profile(username, download_root)
+    except (ConfigError, CredentialError, IliasError, PolicyViolation, OSError, ValueError) as exc:
+        raise SetupError(str(exc)) from None
+    except httpx.HTTPError:
+        raise SetupError("Could not reach ILIAS. Check your network and try again.") from None
+
+
+def open_account_setup(username: str | None = None, download_root: str | None = None, *, verify: bool = True) -> str:
+    """Open the local form and return the username once the account is saved."""
+    user = _setup_username(username)
+    ilias_url = load_settings(user or "setup").base_url
+
+    def save(account: str, password: str) -> None:
+        _save_account(account, password, download_root, verify=verify)
+
+    return browser_setup(user, ilias_url, save)
+
+
+def _setup_username(username: str | None) -> str:
+    return (username or os.environ.get("ILIAS_USER") or "").strip() or read_profile().get("username", "")
+
+
+def _setup(args: argparse.Namespace) -> int:
+    def save(username: str, password: str) -> None:
+        _save_account(username, password, args.download_root, verify=not args.skip_check)
+
+    try:
+        if args.terminal:
+            user = _setup_username(args.user)
+            prompt = f"ILIAS username [{user}]: " if user else "ILIAS username: "
+            user = input(prompt).strip() or user
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                password = getpass.getpass("ILIAS password (leave blank to keep the saved password): ")
+            save(user, password)
+        else:
+            user = open_account_setup(args.user, args.download_root, verify=not args.skip_check)
+    except (KeyboardInterrupt, EOFError):
+        print("Setup cancelled.", file=sys.stderr)
+        return 1
+    except getpass.GetPassWarning:
+        print("Open an interactive terminal to enter your password, or run setup without --terminal.", file=sys.stderr)
+        return 1
+    except (ConfigError, SetupError, OSError, ValueError) as exc:
+        print(f"Setup failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Saved ILIAS account {user}.")
+    if args.no_claude:
+        print(f"MCP server command: {json.dumps(server_command(), ensure_ascii=False)}")
+        return 0
+    result = _add(argparse.Namespace(user=user, config=args.config, download_root=args.download_root, dry_run=False))
+    if result == 0:
+        print("Quit Claude Desktop completely and reopen it to load ILIAS.")
+    return result
 
 
 def _cache(args: argparse.Namespace) -> int:
@@ -189,7 +268,16 @@ def _cache(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="ilias-mcp-config", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=__version__)
     sub = ap.add_subparsers(dest="action", required=True)
+    setup = sub.add_parser("setup", help="save your ILIAS login and configure your MCP client")
+    setup.add_argument("--user", help="pre-fill your ILIAS username")
+    setup.add_argument("--terminal", action="store_true", help="enter credentials in this terminal")
+    setup.add_argument("--skip-check", action="store_true", help="save credentials without testing ILIAS login")
+    setup.add_argument("--download-root", help="folder ilias_download_file may write to")
+    client = setup.add_mutually_exclusive_group()
+    client.add_argument("--no-claude", action="store_true", help="save the account for manual MCP client setup")
+    client.add_argument("--config", help="Claude configuration file to update")
     add = sub.add_parser("add", help="add or update the ilias server in the Claude configuration")
     add.add_argument("--user", required=True, help="ILIAS login, e.g. firstname.lastname")
     add.add_argument("--download-root", help="folder ilias_download_file may write to")
@@ -202,9 +290,9 @@ def main(argv: list[str] | None = None) -> None:
     cache.add_argument("--user", required=True)
     mode = cache.add_mutually_exclusive_group()
     mode.add_argument("--adopt", action="store_true", help="the old cache is this account's: move it in")
-    mode.add_argument("--ask", action="store_true", help="ask before adopting (used by the setup scripts)")
+    mode.add_argument("--ask", action="store_true", help="ask before adopting")
     args = ap.parse_args(argv)
-    actions = {"add": _add, "has-password": _has_password, "cache": _cache}
+    actions = {"setup": _setup, "add": _add, "has-password": _has_password, "cache": _cache}
     raise SystemExit(actions[args.action](args))
 
 

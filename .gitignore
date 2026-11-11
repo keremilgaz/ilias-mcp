@@ -5,3 +5,4 @@ __pycache__/
 .debug/
 selftest-report.json
 build/
+dist/

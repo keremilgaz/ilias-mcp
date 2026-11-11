@@ -3,9 +3,13 @@ import sys
 import types
 from pathlib import Path
 
+import httpx
 import pytest
 
-from ilias_mcp import credentials, install
+from ilias_mcp import config, credentials, install
+from ilias_mcp.client import IliasClient
+
+from .conftest import PASSWORD
 
 CONFIG = "claude_desktop_config.json"
 
@@ -132,3 +136,91 @@ def test_has_password_never_prints_it(monkeypatch, capsys) -> None:
     with pytest.raises(SystemExit) as done:
         install.main(["has-password", "--user", "nobody"])
     assert done.value.code == 1
+
+
+def test_setup_verifies_before_saving_and_updates_claude(fake, tmp_path, monkeypatch, capsys) -> None:
+    profile = tmp_path / "settings.json"
+    claude = tmp_path / "Claude" / CONFIG
+    downloads = tmp_path / "course files"
+    monkeypatch.setattr(config, "profile_path", lambda: profile)
+    monkeypatch.delenv("ILIAS_USER", raising=False)
+    monkeypatch.delenv("ILIAS_DOWNLOAD_ROOT", raising=False)
+    monkeypatch.setattr(install, "IliasClient", lambda settings, password_provider: IliasClient(
+        settings, transport=httpx.MockTransport(fake), password_provider=password_provider, sleep=lambda _: None
+    ))
+    saved = {}
+    monkeypatch.setattr(install, "save_password", lambda service, user, password: saved.update({user: password}))
+
+    def browser(user, url, save):
+        assert user == "max.mustermann" and url == "https://ilias.uni-konstanz.de"
+        with pytest.raises(install.SetupError, match="rejected"):
+            save(user, "bad-password")
+        assert not saved and not profile.exists()
+        save(user, PASSWORD)
+        return user
+
+    monkeypatch.setattr(install, "browser_setup", browser)
+    with pytest.raises(SystemExit) as done:
+        install.main(["setup", "--user", "max.mustermann", "--config", str(claude), "--download-root", str(downloads)])
+    assert done.value.code == 0 and fake.login_posts == 2
+    assert saved == {"max.mustermann": PASSWORD}
+    assert config.load_settings().username == "max.mustermann"
+    assert config.load_settings().download_root == downloads
+    entry = json.loads(claude.read_text("utf-8"))["mcpServers"]["ilias"]
+    assert entry["env"] == {"ILIAS_USER": "max.mustermann", "ILIAS_DOWNLOAD_ROOT": str(downloads)}
+    assert PASSWORD not in profile.read_text() + claude.read_text() + capsys.readouterr().out
+
+
+def test_setup_reuses_a_saved_password_and_supports_other_clients(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(config, "profile_path", lambda: tmp_path / "settings.json")
+    monkeypatch.setattr(install, "keychain_password", lambda service, user: PASSWORD)
+    monkeypatch.setattr(install, "save_password", lambda *_: pytest.fail("the stored password was replaced"))
+    monkeypatch.setattr(install, "IliasClient", lambda *_: pytest.fail("setup contacted ILIAS"))
+    monkeypatch.setattr(install, "claude_config_paths", lambda: pytest.fail("setup touched Claude"))
+    monkeypatch.setattr("builtins.input", lambda prompt: "terminal.user")
+    monkeypatch.setattr(install.getpass, "getpass", lambda prompt: "")
+
+    with pytest.raises(SystemExit) as done:
+        install.main(["setup", "--terminal", "--no-claude", "--skip-check"])
+    assert done.value.code == 0 and config.load_settings("terminal.user").username == "terminal.user"
+    assert config.read_profile() == {"username": "terminal.user"}
+
+
+def test_mac_keychain_updates_an_existing_item(monkeypatch) -> None:
+    entries = {("ilias-mcp", "existing"): b"old"}
+
+    def add(query, _):
+        key = (query["service"], query["account"])
+        if key in entries:
+            return -25299, None
+        entries[key] = query["data"]
+        return 0, None
+
+    def update(query, attrs):
+        entries[(query["service"], query["account"])] = attrs["data"]
+        return 0
+
+    def get(query, _):
+        value = entries.get((query["service"], query["account"]))
+        return (0, value) if value else (-25300, None)
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setitem(sys.modules, "Security", types.SimpleNamespace(
+        kSecClass="class", kSecClassGenericPassword="generic", kSecAttrService="service",
+        kSecAttrAccount="account", kSecReturnData="return", kSecValueData="data",
+        errSecSuccess=0, errSecItemNotFound=-25300, errSecDuplicateItem=-25299,
+        SecItemCopyMatching=get, SecItemAdd=add, SecItemUpdate=update,
+    ))
+    assert credentials.keychain_password("ilias-mcp", "existing") == "old"
+    for user in ("existing", "new"):
+        credentials.save_password("ilias-mcp", user, "nëw password")
+        assert credentials.keychain_password("ilias-mcp", user) == "nëw password"
+
+
+def test_merge_rejects_invalid_server_entry_without_writing(tmp_path) -> None:
+    path = tmp_path / CONFIG
+    original = '{"mcpServers": {"ilias": {"env": ["broken"]}}}'
+    path.write_text(original, "utf-8")
+    with pytest.raises(install.ConfigError, match="invalid 'ilias' entry"):
+        install.merge_config(path, "user", None, ["server"])
+    assert path.read_text("utf-8") == original

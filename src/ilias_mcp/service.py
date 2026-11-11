@@ -27,6 +27,7 @@ from .files import (
 
 CRAWLABLE = {"fold", "grp", "sess", "copa"}
 _TYPED_TARGET = re.compile(r"([a-z]{2,5})[/_](\d+)")
+_WINDOWS_DEVICE_NAME = re.compile(r"(?:CON|CONIN\$|CONOUT\$|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", re.I)
 _SEMESTER = re.compile(
     r"(?P<season>winter|wintersemester|wise|ws|summer|sommersemester|sose|ss)\D{0,12}(?P<year>\d{4})", re.I
 )
@@ -486,19 +487,31 @@ class IliasService:
         key, urls = self._file_key_and_urls(target)
         download = self.client.get_file(urls)
         self.cache.store(key, download.content, download.filename, self._fresh_listing.get(key))
-        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", download.filename or f"ilias-{key}.bin").strip().rstrip(".") or "file"
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", download.filename or f"ilias-{key}.bin").strip().rstrip(" .") or "file"
+        if _WINDOWS_DEVICE_NAME.fullmatch(name.partition(".")[0].rstrip()):
+            name = "_" + name
         dest.mkdir(parents=True, exist_ok=True)
-        path = dest / name
         digest = hashlib.sha256(download.content).hexdigest()
-        if path.exists():
-            if hashlib.sha256(path.read_bytes()).hexdigest() == digest:
-                return {"saved_to": str(path), "status": "already_present"}
-            stem, suffix, n = path.stem, path.suffix, 2
-            while path.exists():
-                path = dest / f"{stem} ({n}){suffix}"
-                n += 1
-        path.write_bytes(download.content)
-        return {"saved_to": str(path), "bytes": len(download.content), "status": "saved"}
+        original = dest / name
+        path, number = original, 2
+        while True:
+            try:
+                stream = path.open("xb")
+            except (FileExistsError, PermissionError) as exc:
+                if not isinstance(exc, FileExistsError) and not path.is_dir() and not path.is_symlink():
+                    raise
+                if not path.is_symlink() and path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest:
+                    return {"saved_to": str(path), "status": "already_present"}
+                path = dest / f"{original.stem} ({number}){original.suffix}"
+                number += 1
+                continue
+            try:
+                with stream:
+                    stream.write(download.content)
+            except OSError:
+                path.unlink(missing_ok=True)
+                raise
+            return {"saved_to": str(path), "bytes": len(download.content), "status": "saved"}
 
     # -- change detection ----------------------------------------------------------
 

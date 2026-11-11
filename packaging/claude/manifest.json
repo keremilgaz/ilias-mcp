@@ -1,0 +1,28 @@
+{
+  "manifest_version": "0.4",
+  "name": "ilias-mcp",
+  "display_name": "ILIAS MCP",
+  "description": "Find course materials, assignments, and announcements in the University of Konstanz ILIAS.",
+  "author": { "name": "Kerem Ilgaz" },
+  "repository": { "type": "git", "url": "https://github.com/keremilgaz/ilias-mcp" },
+  "license": "MIT",
+  "privacy_policies": [
+    "https://ilias.uni-konstanz.de/ilias.php?baseClass=ilstartupgui&cmd=showLegalDocuments&lang=en&client_id=ILIASKONSTANZ&id=tos"
+  ],
+  "server": {
+    "type": "uv",
+    "entry_point": "src/claude.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "src/claude.py"]
+    }
+  },
+  "tools": [
+    { "name": "ilias_setup", "description": "Open the local browser form for your ILIAS account." }
+  ],
+  "tools_generated": true,
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"],
+    "runtimes": { "python": ">=3.10" }
+  }
+}

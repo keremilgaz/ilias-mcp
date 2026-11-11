@@ -1,14 +1,18 @@
-"""Settings, read from environment variables (set in the MCP client config)."""
+"""Local settings with overrides from the MCP client's environment."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+from platformdirs import user_config_path, user_documents_path
 
 
 def _default_cache_dir() -> Path:
@@ -16,7 +20,58 @@ def _default_cache_dir() -> Path:
         return Path.home() / "Library" / "Caches" / "ilias-mcp"
     if sys.platform == "win32":
         return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "ilias-mcp" / "Cache"
-    return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ilias-mcp"
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ilias-mcp"
+
+
+def _default_download_root() -> Path:
+    return user_documents_path() / "ILIAS"
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+class AccountNotConfigured(ConfigError):
+    pass
+
+
+def profile_path() -> Path:
+    return user_config_path("ilias-mcp", appauthor=False, roaming=True) / "settings.json"
+
+
+def read_profile() -> dict[str, str]:
+    path = profile_path()
+    try:
+        data = json.loads(path.read_text("utf-8-sig"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        raise ConfigError(f"Could not read {path}. Fix or move it, then run ilias-mcp-config setup.") from None
+    if not isinstance(data, dict) or any(not isinstance(value, str) for value in data.values()):
+        raise ConfigError(f"Unexpected settings in {path}. Fix or move it, then run ilias-mcp-config setup.")
+    return data
+
+
+def write_json(path: Path, data: dict) -> None:
+    """Replace a JSON file only after its new contents have been written."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = NamedTemporaryFile(dir=path.parent, mode="w", encoding="utf-8", delete=False)
+    temp = Path(stream.name)
+    try:
+        with stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def save_profile(username: str, download_root: str | None) -> None:
+    profile = read_profile()
+    profile["username"] = username
+    if download_root:
+        profile["download_root"] = str(Path(download_root).expanduser().absolute())
+    write_json(profile_path(), profile)
 
 
 @dataclass(frozen=True)
@@ -30,8 +85,8 @@ class Settings:
     timeout: float = 30.0
     max_requests_per_call: int = 60
     max_file_bytes: int = 60 * 1024 * 1024
-    cache_dir: Path = _default_cache_dir()
-    download_root: Path = Path.home() / "Documents" / "ILIAS"
+    cache_dir: Path = field(default_factory=_default_cache_dir)
+    download_root: Path = field(default_factory=_default_download_root)
     # File download route as used by the Konstanz installation (cmdNode values
     # are installation-specific); the generic goto.php route is tried after it.
     sendfile_template: str = (
@@ -63,12 +118,24 @@ class Settings:
         """Cache of this ILIAS installation and account: file texts, reading records,
         snapshots and routes are never shared between accounts."""
         slug = re.sub(r"[^a-z0-9._-]+", "_", f"{self.host}-{self.client_id}-{self.username}".lower())
-        return Path(self.cache_dir) / "accounts" / slug
+        accounts = Path(self.cache_dir) / "accounts"
+        old_path = accounts / slug
+        identity = self.account_identity()
+        try:
+            if json.loads((old_path / "account.json").read_text("utf-8")) == identity:
+                return old_path
+        except (OSError, ValueError):
+            pass
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
+        return accounts / f"{slug[:48]}-{digest}"
+
+    def account_identity(self) -> dict[str, str]:
+        return {"base_url": self.base_url, "client_id": self.client_id, "username": self.username}
 
 
 # Cache layout before 0.3: kept directly in cache_dir, with no record of the account
 # it belongs to. Nothing in it shows whose it is, so it is never moved automatically:
-# the user adopts it (`ilias-mcp-config cache --user ... --adopt`, or setup asks).
+# the user adopts it with `ilias-mcp-config cache --user ... --adopt`.
 _LEGACY = ("files", "snapshots", "routes.json")
 
 
@@ -78,8 +145,7 @@ def prepare_cache(settings: Settings) -> Path:
     target.mkdir(parents=True, exist_ok=True)
     owner = target / "account.json"
     if not owner.exists():
-        owner.write_text(json.dumps({"base_url": settings.base_url, "client_id": settings.client_id,
-                                     "username": settings.username}), "utf-8")
+        write_json(owner, settings.account_identity())
     return target
 
 
@@ -115,10 +181,16 @@ def adopt_legacy_cache(settings: Settings) -> list[str]:
 
 
 def load_settings(username: str | None = None) -> Settings:
-    username = (username or os.environ.get("ILIAS_USER", "")).strip()
+    profile = read_profile()
+    username = (username or os.environ.get("ILIAS_USER") or "").strip() or profile.get("username", "")
     if not username:
-        raise SystemExit("ILIAS_USER is not set (your ILIAS login, e.g. firstname.lastname).")
+        raise AccountNotConfigured(
+            "No ILIAS account is configured. In the Claude Desktop extension, ask to open ILIAS setup. "
+            "From a terminal, run ilias-mcp-config setup."
+        )
     kwargs: dict = {"username": username}
+    if profile.get("download_root"):
+        kwargs["download_root"] = Path(profile["download_root"])
     env_map = {
         "ILIAS_BASE_URL": ("base_url", str),
         "ILIAS_CLIENT_ID": ("client_id", str),

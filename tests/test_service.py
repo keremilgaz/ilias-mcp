@@ -144,8 +144,21 @@ def test_old_cache_is_never_given_to_an_account_unasked(tmp_path) -> None:
     service_dirs = prepare_cache(kerem)
     (service_dirs / "snapshots" / "pending").mkdir(parents=True)  # a server already started: empty dirs
     assert adopt_legacy_cache(kerem) == ["files", "snapshots", "routes.json"]
-    assert service_dirs.name == "ilias.uni-konstanz.de-iliaskonstanz-kerem.ilgaz"
+    assert service_dirs == kerem.account_dir
     assert (service_dirs / "files" / "index.json").exists() and not legacy_cache(kerem)
+
+
+def test_matching_existing_cache_is_reused_without_sharing_it_with_another_account(tmp_path) -> None:
+    from ilias_mcp.config import Settings, prepare_cache
+
+    old = Settings(username="max.user", cache_dir=tmp_path)
+    alias = Settings(username="Max.User", cache_dir=tmp_path)
+    assert old.account_dir != alias.account_dir
+    old_dir = tmp_path / "accounts" / "ilias.uni-konstanz.de-iliaskonstanz-max.user"
+    old_dir.mkdir(parents=True)
+    (old_dir / "account.json").write_text(json.dumps(old.account_identity()), "utf-8")
+    assert prepare_cache(old) == old_dir
+    assert prepare_cache(alias) != old_dir
 
 
 def test_adopting_refuses_to_merge_into_saved_data(tmp_path) -> None:
@@ -290,6 +303,20 @@ def test_download_stays_inside_root(service: IliasService, fake, settings) -> No
         service.download_file("2131745", "/tmp/elsewhere")
     with pytest.raises(ValueError):
         service.download_file("2131745", "../../escape")
+
+
+def test_download_handles_windows_device_name_and_keeps_existing_file(service: IliasService, fake, settings) -> None:
+    content = make_pdf(["x"])
+    fake.files["2131745"] = (content, "CON.pdf")
+    root = settings.download_root
+    root.mkdir(parents=True)
+    existing = root / "_CON.pdf"
+    existing.write_bytes(b"unrelated file")
+    saved = service.download_file("2131745", ".")
+    assert Path(saved["saved_to"]).name == "_CON (2).pdf"
+    assert Path(saved["saved_to"]).read_bytes() == content
+    assert existing.read_bytes() == b"unrelated file"
+    assert service.download_file("2131745", ".")["status"] == "already_present"
 
 
 def test_incomplete_scan_keeps_the_baseline(service: IliasService, fake) -> None:

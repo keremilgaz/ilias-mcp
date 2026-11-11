@@ -1,109 +1,90 @@
-# Set up ilias-mcp on Windows: virtualenv, password in Windows Credential Manager,
-# self-test and Claude desktop configuration.
-#
-#   powershell -ExecutionPolicy Bypass -File setup.ps1              full setup
-#   powershell -ExecutionPolicy Bypass -File setup.ps1 -SkipCheck   skip the live self-test
-#
-# (-ExecutionPolicy Bypass applies to this one run only; nothing is changed permanently.)
-param([switch]$SkipCheck)
+# Install ilias-mcp on Windows and open account setup.
+param(
+    [switch]$SkipCheck,
+    [switch]$Terminal,
+    [switch]$NoClaude,
+    [string]$User,
+    [string]$DownloadRoot,
+    [switch]$ChatGPT,
+    [string]$TunnelClient,
+    [string]$TunnelId
+)
 
 $ErrorActionPreference = "Stop"
+# Some shells launch PowerShell without .EXE in PATHEXT.
+if (($env:PATHEXT -split ';') -notcontains '.EXE') {
+    $env:PATHEXT = ".EXE;$env:PATHEXT"
+}
 Set-Location -LiteralPath $PSScriptRoot
-$Dir = (Get-Location).Path
-$Service = "ilias-mcp"
-$VenvPython = Join-Path $Dir ".venv\Scripts\python.exe"
-$VenvConfig = Join-Path $Dir ".venv\Scripts\ilias-mcp-config.exe"
-$VenvCheck = Join-Path $Dir ".venv\Scripts\ilias-mcp-check.exe"
+$VenvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+$Uv = Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 
 function Invoke-Native([string]$Exe, [string[]]$Arguments) {
     & $Exe @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "'$Exe $($Arguments -join ' ')' failed (exit code $LASTEXITCODE)" }
+    if ($LASTEXITCODE -ne 0) { throw "$Exe failed (exit code $LASTEXITCODE)." }
 }
 
 function Find-Python {
-    # The py launcher comes with the python.org installer; 'python' may be the
-    # Microsoft Store alias, which fails the version test below unless Python is installed.
-    foreach ($candidate in @("py -3.13", "py -3.12", "py -3.11", "py -3.10", "py -3", "python", "python3")) {
-        $parts = $candidate -split " "
-        $exe = $parts[0]
-        if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) { continue }
-        $rest = @($parts | Select-Object -Skip 1)
+    $candidates = @(
+        @{ Exe = "py.exe"; Flags = @("-3") },
+        @{ Exe = "python.exe"; Flags = @() },
+        @{ Exe = "python3.exe"; Flags = @() }
+    )
+    if ($env:LOCALAPPDATA) {
+        $installRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
+        $folders = Get-ChildItem -LiteralPath $installRoot -Directory -Filter "Python3*" -ErrorAction SilentlyContinue
+        foreach ($folder in $folders) {
+            $candidates += @{ Exe = (Join-Path $folder.FullName "python.exe"); Flags = @() }
+        }
+    }
+    foreach ($candidate in $candidates) {
+        $command = Get-Command $candidate.Exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $command) { continue }
+        $flags = $candidate.Flags
         try {
-            & $exe @rest -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" *> $null
-            if ($LASTEXITCODE -eq 0) { return $candidate }
+            & $command.Source @flags -c "import sys; sys.exit(sys.version_info < (3, 10))" *> $null
+            if ($LASTEXITCODE -eq 0) { return @{ Exe = $command.Source; Flags = $flags } }
         } catch { }
     }
     return $null
 }
 
-Write-Host "== 1/4 Python environment (.venv)"
-if (Test-Path -LiteralPath ".venv") {
-    Write-Host "   Updating the existing .venv. If Claude is running with ilias-mcp, quit it first:"
-    Write-Host "   Windows does not let the update replace files of a running program."
-}
-$Python = Find-Python
-if ($Python) {
-    $parts = $Python -split " "
-    $exe = $parts[0]
-    $rest = @($parts | Select-Object -Skip 1)
-    Invoke-Native $exe ($rest + @("-m", "venv", ".venv"))
-    Write-Host "   $(& $VenvPython --version) - $Python"
-    Invoke-Native $VenvPython @("-m", "pip", "install", "-q", "--upgrade", "pip")
-    Invoke-Native $VenvPython @("-m", "pip", "install", "-q", "-e", ".")
-} elseif (Get-Command uv -ErrorAction SilentlyContinue) {
-    Invoke-Native "uv" @("venv", "-q", "-p", "3.12", ".venv")
-    Invoke-Native "uv" @("pip", "install", "-q", "-p", $VenvPython, "-e", ".")
-} else {
-    Write-Host "   Python 3.10+ not found. Install it from https://www.python.org/downloads/"
-    Write-Host "   (or: winget install Python.Python.3.12) and run this script again."
-    exit 1
-}
-
-Write-Host ""
-Write-Host "== 2/4 ILIAS username and password (Windows Credential Manager)"
-$IliasUser = (Read-Host "   ILIAS username (firstname.lastname)").Trim()
-if (-not $IliasUser) { Write-Host "   The username cannot be empty."; exit 1 }
-& $VenvConfig has-password --user $IliasUser | Out-Null
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "   A saved password already exists."
-    Write-Host "   (To replace it: .venv\Scripts\python -m keyring del $Service $IliasUser, then run this script again.)"
-} else {
-    Write-Host "   Type your ILIAS password and press Enter. Nothing is shown while you type;"
-    Write-Host "   the password goes straight into Windows Credential Manager and is never written to a file."
-    Invoke-Native $VenvPython @("-m", "keyring", "set", $Service, $IliasUser)
-}
-# A cache from version 0.2 or older records no account: asks whether it is this one's.
-& $VenvConfig cache --user $IliasUser --ask
-
-Write-Host ""
-if ($SkipCheck) {
-    Write-Host "== 3/4 Self-test skipped"
-} else {
-    Write-Host "== 3/4 Self-test (log in + 2 courses; roughly 20-45 requests, at most one per second)"
-    $env:ILIAS_USER = $IliasUser
-    & $VenvCheck --report selftest-report.json --dump .debug\pages
-    $ok = ($LASTEXITCODE -eq 0)
-    Remove-Item Env:ILIAS_USER
-    if ($ok) {
-        Write-Host "   Self-test passed."
+if (-not (Test-Path -LiteralPath $VenvPython)) {
+    if (Test-Path -LiteralPath ".venv") {
+        throw "The existing .venv is incompatible with Windows. Rename it and rerun setup."
+    }
+    if ($Uv) {
+        Invoke-Native $Uv.Source @("venv", "--python", ">=3.10", ".venv")
     } else {
-        Write-Host "   Part of the self-test failed; see selftest-report.json."
-        Write-Host "   (A rejected password is not retried: replace the saved password and run this script again.)"
+        $Python = Find-Python
+        if (-not $Python) { throw "Install Python 3.10+ from python.org or install uv, then rerun setup." }
+        Invoke-Native $Python.Exe ($Python.Flags + @("-m", "venv", ".venv"))
     }
 }
 
-Write-Host ""
-Write-Host "== 4/4 Claude desktop app"
-$Documents = [Environment]::GetFolderPath("MyDocuments")  # follows OneDrive folder redirection
-if (-not $Documents) { $Documents = Join-Path $HOME "Documents" }
-$DefaultRoot = Join-Path $Documents "ILIAS"
-$DownloadRoot = (Read-Host "   Folder that ilias_download_file may write to [$DefaultRoot]").Trim()
-if (-not $DownloadRoot) { $DownloadRoot = $DefaultRoot }
-$Answer = Read-Host "   Add the 'ilias' server to the Claude configuration? (a backup is made first) [y/N]"
-if ($Answer -match '^[yYeE]') {
-    Invoke-Native $VenvConfig @("add", "--user", $IliasUser, "--download-root", $DownloadRoot)
-    Write-Host "   Quit Claude completely and open it again. Closing the window is not enough:"
-    Write-Host "   quit it from the tray icon next to the clock (or end it in Task Manager)."
+if ($Uv) {
+    Invoke-Native $Uv.Source @("pip", "install", "--python", $VenvPython, "-e", ".")
 } else {
-    Invoke-Native $VenvConfig @("add", "--user", $IliasUser, "--download-root", $DownloadRoot, "--dry-run")
+    & $VenvPython -m pip --version *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Invoke-Native $VenvPython @("-m", "ensurepip", "--upgrade")
+    }
+    Invoke-Native $VenvPython @("-m", "pip", "install", "-e", ".")
 }
+
+if ($ChatGPT) {
+    $TunnelArgs = @("-m", "ilias_mcp.chatgpt")
+    if ($TunnelClient) { $TunnelArgs += @("--tunnel-client", $TunnelClient) }
+    if ($TunnelId) { $TunnelArgs += @("--tunnel-id", $TunnelId) }
+    & $VenvPython @TunnelArgs
+    exit $LASTEXITCODE
+}
+
+$SetupArgs = @("-m", "ilias_mcp.install", "setup")
+if ($SkipCheck) { $SetupArgs += "--skip-check" }
+if ($Terminal) { $SetupArgs += "--terminal" }
+if ($NoClaude) { $SetupArgs += "--no-claude" }
+if ($User) { $SetupArgs += @("--user", $User) }
+if ($DownloadRoot) { $SetupArgs += @("--download-root", $DownloadRoot) }
+& $VenvPython @SetupArgs
+exit $LASTEXITCODE

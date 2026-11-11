@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from ilias_mcp.client import BudgetExceeded, IliasClient, LoginError
+from ilias_mcp.client import BudgetExceeded, IliasClient, IliasError, LoginError
 from ilias_mcp.policy import PolicyViolation
 
 from .conftest import PASSWORD
@@ -32,6 +32,21 @@ def test_wrong_password_is_not_retried(fake, settings) -> None:
         client.get_page("/goto.php/crs/2125765")
     assert fake.login_posts == 1  # second call did not try again
     assert "wrong" not in str(first.value)
+
+
+def test_temporary_login_page_failure_does_not_block_the_next_call(fake, settings) -> None:
+    def respond(request):
+        if not fake.requests:
+            fake.requests.append(request)
+            return httpx.Response(503)
+        return fake(request)
+
+    client = IliasClient(settings, transport=httpx.MockTransport(respond), password_provider=lambda: PASSWORD,
+                         sleep=lambda _: None)
+    with pytest.raises(IliasError, match="HTTP 503"):
+        client.login()
+    client.login()
+    assert client.logged_in and fake.login_posts == 1
 
 
 def test_password_never_appears_in_errors(fake, settings) -> None:

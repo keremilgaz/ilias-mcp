@@ -13,14 +13,14 @@ from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
-from . import parsers
+from . import __version__, parsers
 from .config import Settings
 from .credentials import keychain_password
 from .policy import PolicyViolation, ReadOnlyPolicy
 
 log = logging.getLogger("ilias_mcp")
 
-USER_AGENT = "ilias-mcp/0.1 (personal read-only client)"
+USER_AGENT = f"ilias-mcp/{__version__} (personal read-only client)"
 
 
 class IliasError(RuntimeError):
@@ -177,6 +177,7 @@ class IliasClient:
             if self._login_blocked:
                 raise LoginError(self._login_blocked)
             resp = self.http.get(self.settings.login_url)
+            _raise_for_status(resp)
             if parsers.is_logged_in(resp.text):
                 self.logged_in = True
                 return
@@ -202,6 +203,8 @@ class IliasClient:
                 )
             finally:
                 data.clear()
+            if resp.status_code == 429 or resp.status_code >= 500:
+                _raise_for_status(resp)
             if parsers.is_logged_in(resp.text):
                 self.logged_in = True
                 log.info("logged in as %s", self.settings.username)
@@ -209,9 +212,11 @@ class IliasClient:
             if parsers.is_login_page(resp.text):
                 self._block(
                     "ILIAS rejected the username or password. Not retrying, to avoid an "
-                    "account lockout. Fix the Keychain item, then restart the server."
+                    "account lockout. Run ilias-mcp-config setup, then restart the server."
                 )
+            _raise_for_status(resp)
             check = self.http.get(self.settings.dashboard_url)
+            _raise_for_status(check)
             if parsers.is_logged_in(check.text):
                 self.logged_in = True
                 return

@@ -6,7 +6,7 @@ refused *before* it leaves the machine.
 
 The rules, in order:
 
-1. Only ``https`` on the configured ILIAS host.
+1. Only ``https`` on the configured ILIAS host and port.
 2. Only ``GET``. The single exception is the login form ``POST``, and only
    while :meth:`ReadOnlyPolicy.login_window` is open for that exact URL.
 3. Only known entry points (``ilias.php``, ``login.php``, static ``/data/``
@@ -28,7 +28,7 @@ import re
 import threading
 from contextlib import contextmanager
 from typing import Iterator
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import SplitResult, parse_qsl, urlsplit
 
 
 class PolicyViolation(RuntimeError):
@@ -87,6 +87,7 @@ STATIC_PREFIX = "/data/"
 class ReadOnlyPolicy:
     def __init__(self, host: str) -> None:
         self.host = host.lower()
+        self._origin = _origin(urlsplit(f"https://{host}"))
         self._lock = threading.Lock()
         self._login_post_url: str | None = None
 
@@ -107,8 +108,10 @@ class ReadOnlyPolicy:
 
         if parts.scheme != "https":
             raise PolicyViolation(f"refused non-https URL: {parts.scheme}://{parts.netloc}")
-        if (parts.hostname or "").lower() != self.host:
-            raise PolicyViolation(f"refused request to another host: {parts.hostname}")
+        if parts.username is not None or parts.password is not None:
+            raise PolicyViolation("refused credentials embedded in a URL")
+        if _origin(parts) != self._origin:
+            raise PolicyViolation(f"refused request to another host or port: {parts.netloc}")
 
         if method != "GET":
             with self._lock:
@@ -159,9 +162,13 @@ class ReadOnlyPolicy:
 def _same_url(a: str, b: str) -> bool:
     pa, pb = urlsplit(a), urlsplit(b)
     return (
-        pa.scheme == pb.scheme
-        and (pa.hostname or "").lower() == (pb.hostname or "").lower()
+        _origin(pa) == _origin(pb)
         and pa.path == pb.path
         and sorted(parse_qsl(pa.query, keep_blank_values=True))
         == sorted(parse_qsl(pb.query, keep_blank_values=True))
     )
+
+
+def _origin(parts: SplitResult) -> tuple[str, str | None, int]:
+    port = parts.port
+    return parts.scheme, parts.hostname, port if port is not None else 443
