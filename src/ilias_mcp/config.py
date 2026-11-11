@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,23 +66,56 @@ class Settings:
         return Path(self.cache_dir) / "accounts" / slug
 
 
-_LEGACY = ("files", "snapshots", "routes.json")  # cache layout before 0.3, one account per machine
+# Cache layout before 0.3: kept directly in cache_dir, with no record of the account
+# it belongs to. Nothing in it shows whose it is, so it is never moved automatically:
+# the user adopts it (`ilias-mcp-config cache --user ... --adopt`, or setup asks).
+_LEGACY = ("files", "snapshots", "routes.json")
 
 
 def prepare_cache(settings: Settings) -> Path:
-    """Create the account's cache folder. A cache from before 0.3 (kept directly in
-    cache_dir, without an account) is moved into the first account that starts."""
-    base, target = Path(settings.cache_dir), settings.account_dir
-    if not target.exists():
-        target.mkdir(parents=True)
-        for name in _LEGACY:
-            if (base / name).exists():
-                (base / name).replace(target / name)
+    """Create the account's cache folder, stamped with the account it belongs to."""
+    target = settings.account_dir
+    target.mkdir(parents=True, exist_ok=True)
+    owner = target / "account.json"
+    if not owner.exists():
+        owner.write_text(json.dumps({"base_url": settings.base_url, "client_id": settings.client_id,
+                                     "username": settings.username}), "utf-8")
     return target
 
 
-def load_settings() -> Settings:
-    username = os.environ.get("ILIAS_USER", "").strip()
+def legacy_cache(settings: Settings) -> list[Path]:
+    """Parts of a pre-0.3 cache that are still waiting to be adopted."""
+    base = Path(settings.cache_dir)
+    return [base / name for name in _LEGACY if (base / name).exists()]
+
+
+def has_data(path: Path) -> bool:
+    return path.is_file() or (path.is_dir() and any(p.is_file() for p in path.rglob("*")))
+
+
+def adopt_legacy_cache(settings: Settings) -> list[str]:
+    """Move a pre-0.3 cache into this account. Only call this when the user has said
+    the old cache is from this account; returns the names moved."""
+    target = prepare_cache(settings)
+    legacy = legacy_cache(settings)
+    clash = [p.name for p in legacy if p.name != "routes.json" and has_data(target / p.name)]
+    if clash:
+        raise ValueError(f"{target} already has its own {', '.join(clash)}; not merging the old cache into it")
+    moved = []
+    for path in legacy:
+        destination = target / path.name
+        if destination.exists():
+            if path.name == "routes.json":  # learned routes are the same for every account
+                path.unlink()
+                continue
+            shutil.rmtree(destination)  # empty folders made by a server that already started
+        path.replace(destination)
+        moved.append(path.name)
+    return moved
+
+
+def load_settings(username: str | None = None) -> Settings:
+    username = (username or os.environ.get("ILIAS_USER", "")).strip()
     if not username:
         raise SystemExit("ILIAS_USER is not set (your ILIAS login, e.g. firstname.lastname).")
     kwargs: dict = {"username": username}

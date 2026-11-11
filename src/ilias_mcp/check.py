@@ -65,8 +65,10 @@ def main() -> None:
         try:
             with client.call_scope(80):
                 entry["result"] = fn()
-            # A crawl that could not open part of a course is a failure too, not a pass.
-            entry["ok"] = "error" not in entry["result"] and not entry["result"].get("errors")
+            # A crawl that could not open part of a course, or stopped at the request
+            # budget before the end, did not test everything: a failure, not a pass.
+            result = entry["result"]
+            entry["ok"] = "error" not in result and not result.get("errors") and not result.get("truncated")
         except Exception as exc:
             entry["ok"] = False
             entry["error"] = f"{type(exc).__name__}: {exc}"

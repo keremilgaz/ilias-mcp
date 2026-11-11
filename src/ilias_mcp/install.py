@@ -4,11 +4,14 @@ Used by setup.sh (macOS) and setup.ps1 (Windows); also works on its own:
 
     ilias-mcp-config add --user firstname.lastname [--download-root DIR] [--config FILE] [--dry-run]
     ilias-mcp-config has-password --user firstname.lastname
+    ilias-mcp-config cache --user firstname.lastname [--adopt | --ask]
 
 `add` keeps every other server and setting, makes a timestamped backup before
 changing an existing file and refuses to touch a file that is not valid JSON.
 `has-password` only reports whether a password is saved (exit code 0 or 1);
-it never prints it.
+it never prints it. `cache` shows the account's cache folder; a cache from
+version 0.2 or older records no account, so it is used only after `--adopt`
+(or a yes to `--ask`) says it is this account's.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Mapping
 
+from .config import adopt_legacy_cache, has_data, legacy_cache, load_settings
 from .credentials import CredentialError, keychain_password, store_hint
 
 SERVER_NAME = "ilias"
@@ -148,6 +152,40 @@ def _has_password(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cache(args: argparse.Namespace) -> int:
+    settings = load_settings(args.user)
+    target = settings.account_dir
+    if args.ask and not legacy_cache(settings):
+        return 0  # setup: nothing to ask about
+    state = "has saved data" if any(has_data(target / n) for n in ("files", "snapshots")) else "empty"
+    print(f"   cache of {args.user}: {target} ({state})")
+    accounts = Path(settings.cache_dir) / "accounts"
+    others = sorted(p.name for p in accounts.iterdir() if p.is_dir() and p != target) if accounts.is_dir() else []
+    if others:
+        print(f"   other accounts on this computer: {', '.join(others)}")
+    if not legacy_cache(settings):
+        print("   no cache from an older version is waiting")
+        return 0
+    print(f"   A cache from version 0.2 or older was found in {settings.cache_dir}.")
+    print("   It does not record whose account it was, so it is not used until you adopt it.")
+    adopt = args.adopt
+    if not adopt and args.ask:
+        try:
+            adopt = input(f"   Is it from {args.user}'s ILIAS account? [y/N] ").strip().lower().startswith(("y", "e"))
+        except EOFError:
+            adopt = False
+    if not adopt:
+        print(f"   To adopt it later: ilias-mcp-config cache --user {args.user} --adopt")
+        return 0
+    try:
+        moved = adopt_legacy_cache(settings)
+    except (ValueError, OSError) as exc:
+        print(f"   error: {exc}")
+        return 1
+    print(f"   adopted into {target}: {', '.join(moved) or 'nothing to move'}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="ilias-mcp-config", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -160,8 +198,14 @@ def main(argv: list[str] | None = None) -> None:
     has = sub.add_parser("has-password", help="exit 0 if a password is saved for this user")
     has.add_argument("--user", required=True)
     has.add_argument("--service", default=os.environ.get("ILIAS_KEYCHAIN_SERVICE", "ilias-mcp"))
+    cache = sub.add_parser("cache", help="show this account's cache; adopt a cache from version 0.2 or older")
+    cache.add_argument("--user", required=True)
+    mode = cache.add_mutually_exclusive_group()
+    mode.add_argument("--adopt", action="store_true", help="the old cache is this account's: move it in")
+    mode.add_argument("--ask", action="store_true", help="ask before adopting (used by the setup scripts)")
     args = ap.parse_args(argv)
-    raise SystemExit(_add(args) if args.action == "add" else _has_password(args))
+    actions = {"add": _add, "has-password": _has_password, "cache": _cache}
+    raise SystemExit(actions[args.action](args))
 
 
 if __name__ == "__main__":

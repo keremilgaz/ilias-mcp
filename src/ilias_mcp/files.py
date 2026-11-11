@@ -298,11 +298,26 @@ class FileCache:
 
     def mark_read(self, ref_id: str, sha256: str, pages: list[int]) -> None:
         entry = self.version(ref_id, sha256=sha256)
-        if entry is None:
+        if entry is None or not pages:
             return
         entry["read_pages"] = sorted(set(entry["read_pages"]) | set(pages))
         entry["last_read"] = dates.now_berlin().isoformat(timespec="minutes")
+        for page in pages:
+            entry.get("partial", {}).pop(str(page), None)
+        if not entry.get("partial"):
+            entry.pop("partial", None)
         self._save()
+
+    def progress(self, ref_id: str, sha256: str, page: int) -> int:
+        """How far into a long page of this version has been returned, in characters."""
+        entry = self.version(ref_id, sha256=sha256)
+        return int((entry or {}).get("partial", {}).get(str(page), 0))
+
+    def set_progress(self, ref_id: str, sha256: str, page: int, upto: int) -> None:
+        entry = self.version(ref_id, sha256=sha256)
+        if entry is not None:
+            entry.setdefault("partial", {})[str(page)] = upto
+            self._save()
 
     def status(self, ref_id: str, listing: dict | None) -> dict | None:
         """How much of this file (as currently listed) was read before."""

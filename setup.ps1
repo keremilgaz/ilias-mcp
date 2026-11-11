@@ -72,6 +72,8 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "   the password goes straight into Windows Credential Manager and is never written to a file."
     Invoke-Native $VenvPython @("-m", "keyring", "set", $Service, $IliasUser)
 }
+# A cache from version 0.2 or older records no account: asks whether it is this one's.
+& $VenvConfig cache --user $IliasUser --ask
 
 Write-Host ""
 if ($SkipCheck) {

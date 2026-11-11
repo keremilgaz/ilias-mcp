@@ -171,6 +171,7 @@ def ilias_read_file(
     force: bool = False,
     max_chars: int = 15000,
     offset: int = 0,
+    version: str | None = None,
 ) -> dict:
     """Text of a course file (PDF, PPTX, DOCX, text, ZIP) by ref_id or download URL.
 
@@ -178,11 +179,13 @@ def ilias_read_file(
     file returns status 'already_read'. `pages='2-4,7'` re-opens specific pages.
     `query='deadline|due|submit'` returns keyword snippets instead of full text
     (not counted as read). `force=true` returns everything again. A page longer
-    than max_chars is cut: the answer then has `continue_with` (pages + offset)
-    for the next call.
+    than max_chars is cut: the answer then has `continue_with` (pages, offset,
+    version); pass all three to the next call. If the file changed in between,
+    the new version is returned from the start of the page.
     """
     return service.read_file(target, pages=pages, query=query, force=force,
-                             max_chars=max(1000, min(max_chars, 60000)), offset=max(0, int(offset)))
+                             max_chars=max(1000, min(max_chars, 60000)), offset=max(0, int(offset)),
+                             version=version)
 
 
 @mcp.tool(annotations=READ_ONLY)

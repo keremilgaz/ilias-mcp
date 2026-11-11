@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from . import dates, parsers
+from . import __version__, dates, parsers
 from .client import BudgetExceeded, IliasClient, IliasError, LoginError, Page
-from .config import Settings
+from .config import Settings, legacy_cache
 from .policy import PolicyViolation
 from .files import (
     FileCache,
@@ -59,6 +59,25 @@ def target_url(target: str) -> str:
     if target.isdigit():
         return f"/ilias.php?baseClass=ilrepositorygui&ref_id={target}"
     raise ValueError(f"cannot interpret target {target!r}; use a URL, 'crs/123' or a ref_id")
+
+
+def _item_level(sig: dict) -> int:
+    if "_level" in sig:
+        return int(sig["_level"])
+    return len(sig["path"].split(" / ")) if sig.get("path") else 0  # baselines from 0.2
+
+
+def _outside_scope(key: str, before: dict[str, dict], depth: int, assignments: bool, forums: bool) -> bool:
+    """Whether a baseline entry lies outside what a scan with these settings looks at."""
+    kind, _, rest = key.partition(":")
+    if kind == "item":
+        return _item_level(before[key]) > depth
+    if kind in ("ass", "thr"):
+        if not (assignments if kind == "ass" else forums):
+            return True
+        parent = before.get(f"item:{rest.split(':', 1)[0]}")
+        return parent is not None and _item_level(parent) > depth  # its exercise/forum was not visited
+    return False
 
 
 def _ref_of(target: str) -> str | None:
@@ -150,7 +169,8 @@ class IliasService:
     # -- status ----------------------------------------------------------------
 
     def status(self) -> dict:
-        return {
+        result = {
+            "version": __version__,
             "base_url": self.settings.base_url,
             "user": self.settings.username,
             "logged_in": self.client.logged_in,
@@ -161,6 +181,11 @@ class IliasService:
             "download_root": str(self.settings.download_root),
             "policy": self.client.policy.describe(),
         }
+        if legacy_cache(self.settings):
+            result["old_cache"] = (
+                "a cache from version 0.2 or older is waiting in the cache folder and is not used. If it is "
+                f"this account's: ilias-mcp-config cache --user {self.settings.username} --adopt")
+        return result
 
     # -- courses -----------------------------------------------------------------
 
@@ -214,6 +239,7 @@ class IliasService:
                     continue
                 if path:
                     item["path"] = " / ".join(path)
+                    item["level"] = level  # 1 = inside a sub-folder of the target, 2 = one deeper ...
                 result["items"].append(self._annotate(item))
                 key = item.get("ref_id") or item["url"]
                 if level < depth and item["type"] in CRAWLABLE and key not in visited:
@@ -338,6 +364,7 @@ class IliasService:
         force: bool = False,
         max_chars: int = 15000,
         offset: int = 0,
+        version: str | None = None,
     ) -> dict:
         key, urls = self._file_key_and_urls(target)
         listing = self._fresh_listing.get(key)
@@ -399,7 +426,14 @@ class IliasService:
             selected = unread if not force else list(range(1, total + 1))
 
         # `offset` continues a page that was cut off (one long page: a text file, a
-        # ZIP listing, a dense slide). It applies to the first selected page.
+        # ZIP listing, a dense slide). It applies to the first selected page, and only
+        # to the version it came from: if the file changed in between, start over.
+        sha = entry["sha256"]
+        if offset and version and not sha.startswith(str(version).strip().lower()):
+            result["version_changed"] = True
+            result["note"] = ("the file changed since the part being continued was returned; "
+                              "this is the new version, from the start of the page")
+            offset = 0
         if offset and selected and (offset < 0 or offset >= len(texts[selected[0] - 1])):
             raise ValueError(f"offset {offset} is outside page {selected[0]} "
                              f"({len(texts[selected[0] - 1])} characters)")
@@ -417,18 +451,29 @@ class IliasService:
             if start + len(chunk) < len(text):
                 cut = {"page": number, "next_offset": start + len(chunk), "page_chars": len(text)}
                 break
-        # A page counts as read once its end has been returned.
-        done = [r["page"] for r in returned
-                if r.get("offset", 0) + len(r["text"]) == len(texts[r["page"] - 1])]
-        self.cache.mark_read(key, entry["sha256"], done)
+        # A page counts as read once all of it, from its first character to its end,
+        # has been returned for this version (in one part or several in a row).
+        done = []
+        for r in returned:
+            number, start = r["page"], r.get("offset", 0)
+            end = start + len(r["text"])
+            seen = self.cache.progress(key, sha, number)
+            if start > seen:
+                r["note"] = "starts in the middle of the page: not counted as read"
+                continue
+            if end == len(texts[number - 1]):
+                done.append(number)
+            else:
+                self.cache.set_progress(key, sha, number, max(seen, end))
+        self.cache.mark_read(key, sha, done)
         remaining = [p for p in selected if p not in done]
         result["returned_pages"] = compact_ranges([r["page"] for r in returned])
         if remaining:
             result["remaining_pages"] = compact_ranges(remaining)
         if cut:
-            result["continue_with"] = {"pages": str(cut["page"]), "offset": cut["next_offset"]}
+            result["continue_with"] = {"pages": str(cut["page"]), "offset": cut["next_offset"], "version": sha[:12]}
             result["hint"] = (f"page {cut['page']} was cut at character {cut['next_offset']} of "
-                              f"{cut['page_chars']}; call again with continue_with's pages and offset")
+                              f"{cut['page_chars']}; call again with continue_with's pages, offset and version")
         result["text"] = returned
         return result
 
@@ -475,6 +520,7 @@ class IliasService:
                 sig["description"] = item["description"][:200]
             if item.get("path"):
                 sig["path"] = item["path"]
+                sig["_level"] = item.get("level", 1)
             if item.get("already_read"):
                 sig["_already_read"] = item["already_read"]
             state[f"item:{item.get('ref_id') or item['url']}"] = sig
@@ -519,17 +565,22 @@ class IliasService:
         if crawl.get("truncated"):
             notes.append(crawl["truncated"])
         notes.extend(f"could not open {e}" for e in crawl.get("errors", []))
-        missing = {k: strip(v) for k, v in before.items() if k not in state}
+        # A narrower scan than the baseline's (less depth, no assignments or forums)
+        # did not look at some items at all: keep those as they were, unreported.
+        outside = {k for k in before if k not in state
+                   and _outside_scope(k, before, depth, include_assignments, include_forums)}
+        missing = {k: strip(v) for k, v in before.items() if k not in state and k not in outside}
         # An incomplete scan cannot tell a deleted item from one it could not reach.
         # Unseen items stay in the baseline (so they do not come back as "new" once
         # the folder opens again) and are reported as not seen instead of removed.
         incomplete = bool(notes)
         removed = {} if incomplete else missing
         not_seen = missing if incomplete else {}
-        saved_state = {**{k: before[k] for k in not_seen}, **state}
+        saved_state = {**{k: before[k] for k in (*outside, *not_seen)}, **state}
         scan_id = uuid.uuid4().hex[:12]
         pending = {"target": course_ref, "title": crawl["page"]["title"], "state": saved_state,
-                   "scanned_at": dates.now_berlin().isoformat(timespec="minutes")}
+                   "scanned_at": dates.now_berlin().isoformat(timespec="minutes"),
+                   "scope": {"depth": depth, "assignments": include_assignments, "forums": include_forums}}
         if incomplete:
             pending["kept_unseen"] = len(not_seen)
         (self.snapshots / "pending" / f"{scan_id}.json").write_text(
@@ -554,6 +605,11 @@ class IliasService:
         }
         if previous is None:
             result["note"] = "first scan of this course: everything is listed as new"
+        if outside:
+            result["outside_scope_kept"] = len(outside)
+            result["scope_note"] = (f"{len(outside)} item(s) of the baseline lie outside this scan's scope "
+                                    f"(depth {depth}, assignments {include_assignments}, forums "
+                                    f"{include_forums}); they were not compared and stay in the baseline")
         if incomplete:
             result["notes"] = notes
             result["incomplete"] = True
@@ -614,7 +670,11 @@ class IliasService:
             news_page = dash
             news_notes.append(f"news page could not be opened ({exc}); only dashboard news checked")
         news = parsers.parse_news(news_page.html, news_page.url)
-        last_check = self._last_check()
+        last = self._last_check_record()
+        last_check = last.get("checked_at")
+        # News are compared with the last check that actually read the news page, so
+        # a check without it does not move that point and nothing in between is lost.
+        news_since = last.get("news_checked_at", last_check)
 
         courses: list[dict] = []
         deadlines: list[dict] = []
@@ -645,11 +705,12 @@ class IliasService:
         horizon = now + timedelta(days=14)
         upcoming = sorted((d for d in deadlines if dates.parse_iso(d["deadline"]) <= horizon),
                           key=lambda d: d["deadline"])
-        fresh_news = [n for n in news if last_check is None
-                      or (n.get("date") and dates.parse_iso(n["date"]) > dates.parse_iso(last_check))]
+        fresh_news = [n for n in news if news_since is None
+                      or (n.get("date") and dates.parse_iso(n["date"]) > dates.parse_iso(news_since))]
         check_id = uuid.uuid4().hex[:12]
         (self.snapshots / "pending" / f"check-{check_id}.json").write_text(json.dumps(
-            {"scan_ids": scan_ids, "checked_at": now.isoformat(timespec="minutes")}), "utf-8")
+            {"scan_ids": scan_ids, "checked_at": now.isoformat(timespec="minutes"),
+             "news_complete": not news_notes}), "utf-8")
 
         attention = [c for c in courses if c.get("changes") or c.get("error") or c.get("incomplete")]
         quiet = [c["course"] for c in courses if c not in attention]
@@ -672,8 +733,17 @@ class IliasService:
             "news_since_previous_check": fresh_news,
             "requests_used": self.client.call_requests,
         }
+        if news_since != last_check:
+            result["news_compared_with"] = news_since  # an earlier check could not read the news page
         if news_notes:
-            result["notes"] = news_notes
+            result["notes"] = news_notes + [
+                "committing this check keeps the news comparison point; the next check that reads "
+                "the news page reports everything published since then"]
+        if last_check is None and legacy_cache(self.settings):
+            result.setdefault("notes", []).append(
+                "this account has no saved check yet, but a cache from version 0.2 or older exists. If it "
+                f"is this account's, run: ilias-mcp-config cache --user {self.settings.username} --adopt "
+                "(then check again) to keep its history and reading records")
         if nothing_new and auto_commit:
             result["committed"] = True
             result["next_step"] = "nothing changed; already saved as the new baseline"
@@ -681,12 +751,13 @@ class IliasService:
             result["next_step"] = "record the findings, then ilias_commit_scan(check_id)"
         return result
 
-    def _last_check(self) -> str | None:
+    def _last_check_record(self) -> dict:
         path = self.snapshots / "last-check.json"
         try:
-            return json.loads(path.read_text("utf-8")).get("checked_at")
+            record = json.loads(path.read_text("utf-8"))
+            return record if isinstance(record, dict) else {}
         except (OSError, ValueError):
-            return None
+            return {}
 
     def _commit_check(self, check_id: str, bundle_path: Path) -> dict:
         bundle = json.loads(bundle_path.read_text("utf-8"))
@@ -696,9 +767,13 @@ class IliasService:
                 committed.append(self.commit_scan(scan_id)["course"])
             except ValueError:
                 missing.append(scan_id)
-        (self.snapshots / "last-check.json").write_text(json.dumps(
-            {"checked_at": bundle["checked_at"], "committed_at": dates.now_berlin().isoformat(timespec="minutes")}),
-            "utf-8")
+        last = self._last_check_record()
+        news_checked_at = (bundle["checked_at"] if bundle.get("news_complete", True)
+                           else last.get("news_checked_at", last.get("checked_at")))
+        # news_checked_at may be None (news never read yet): then every news item is new next time.
+        record = {"checked_at": bundle["checked_at"], "committed_at": dates.now_berlin().isoformat(timespec="minutes"),
+                  "news_checked_at": news_checked_at}
+        (self.snapshots / "last-check.json").write_text(json.dumps(record), "utf-8")
         bundle_path.unlink()
         result: dict[str, Any] = {"committed": check_id, "courses": committed, "baseline_from": bundle["checked_at"]}
         if missing:

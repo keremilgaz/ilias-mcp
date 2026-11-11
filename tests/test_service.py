@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -84,7 +85,7 @@ def test_read_file_continues_a_long_page(service: IliasService, fake) -> None:
     fake.files["2131799"] = (text.encode(), "notes.txt")
     first = service.read_file("2131799", max_chars=1000)
     assert first["text"][0]["text"] == text[:1000]
-    assert first["continue_with"] == {"pages": "1", "offset": 1000}
+    assert {k: first["continue_with"][k] for k in ("pages", "offset")} == {"pages": "1", "offset": 1000}
     assert first["remaining_pages"] == "1"  # not read yet
 
     second = service.read_file("2131799", max_chars=1000, **first["continue_with"])
@@ -120,21 +121,125 @@ def test_cache_is_separate_per_account(service: IliasService, fake, settings, cl
     assert other.scan("crs/2125765")["note"].startswith("first scan")  # no shared snapshots
 
 
-def test_prepare_cache_moves_the_old_layout(tmp_path) -> None:
-    from ilias_mcp.config import Settings, prepare_cache
+def _old_cache(base: Path) -> None:
+    """The layout of version 0.2: no account recorded anywhere."""
+    (base / "files" / "texts").mkdir(parents=True)
+    (base / "files" / "index.json").write_text('{"files": {"2131745": {"versions": []}}}', "utf-8")
+    (base / "snapshots" / "pending").mkdir(parents=True)
+    (base / "snapshots" / "2125765.json").write_text("{}", "utf-8")
+    (base / "routes.json").write_text("{}", "utf-8")
+
+
+def test_old_cache_is_never_given_to_an_account_unasked(tmp_path) -> None:
+    from ilias_mcp.config import Settings, adopt_legacy_cache, legacy_cache, prepare_cache
 
     base = tmp_path / "cache"
-    (base / "files").mkdir(parents=True)
-    (base / "files" / "index.json").write_text("{}", "utf-8")
-    (base / "snapshots" / "pending").mkdir(parents=True)
-    (base / "routes.json").write_text("{}", "utf-8")
-    first = Settings(username="Kerem.Ilgaz", cache_dir=base)
-    target = prepare_cache(first)
-    assert target.name == "ilias.uni-konstanz.de-iliaskonstanz-kerem.ilgaz"
-    assert (target / "files" / "index.json").exists() and (target / "routes.json").exists()
-    assert not (base / "files").exists() and not (base / "snapshots").exists()
-    second = prepare_cache(Settings(username="someone.else", cache_dir=base))
-    assert list(second.iterdir()) == []  # a second account starts empty
+    _old_cache(base)
+    first = Settings(username="someone.else", cache_dir=base)
+    target = prepare_cache(first)  # what every server start does
+    assert not (target / "files").exists() and legacy_cache(first)  # left where it was
+    assert json.loads((target / "account.json").read_text("utf-8"))["username"] == "someone.else"
+
+    kerem = Settings(username="Kerem.Ilgaz", cache_dir=base)
+    service_dirs = prepare_cache(kerem)
+    (service_dirs / "snapshots" / "pending").mkdir(parents=True)  # a server already started: empty dirs
+    assert adopt_legacy_cache(kerem) == ["files", "snapshots", "routes.json"]
+    assert service_dirs.name == "ilias.uni-konstanz.de-iliaskonstanz-kerem.ilgaz"
+    assert (service_dirs / "files" / "index.json").exists() and not legacy_cache(kerem)
+
+
+def test_adopting_refuses_to_merge_into_saved_data(tmp_path) -> None:
+    from ilias_mcp.config import Settings, adopt_legacy_cache, prepare_cache
+
+    base = tmp_path / "cache"
+    _old_cache(base)
+    settings = Settings(username="u", cache_dir=base)
+    (prepare_cache(settings) / "snapshots").mkdir()
+    (settings.account_dir / "snapshots" / "1.json").write_text("{}", "utf-8")
+    with pytest.raises(ValueError):
+        adopt_legacy_cache(settings)
+    assert (base / "files" / "index.json").exists()  # nothing moved
+
+
+def test_cli_cache_adopts_only_on_yes(tmp_path, monkeypatch, capsys) -> None:
+    from ilias_mcp import install
+
+    base = tmp_path / "cache"
+    _old_cache(base)
+    monkeypatch.setenv("ILIAS_CACHE_DIR", str(base))
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    with pytest.raises(SystemExit):
+        install.main(["cache", "--user", "u", "--ask"])
+    assert (base / "files").exists()
+    monkeypatch.setattr("builtins.input", lambda prompt: "y")
+    with pytest.raises(SystemExit) as done:
+        install.main(["cache", "--user", "u", "--ask"])
+    assert done.value.code == 0 and not (base / "files").exists()
+    assert "adopted" in capsys.readouterr().out
+
+
+def test_status_and_first_check_point_to_an_old_cache(service: IliasService, settings) -> None:
+    _old_cache(Path(settings.cache_dir))
+    assert "--adopt" in service.status()["old_cache"]
+    check = service.check_all(exclude=["2099965"])
+    assert any("--adopt" in n for n in check["notes"])
+
+
+def test_narrower_scan_does_not_report_removals(service: IliasService) -> None:
+    broad = service.scan("crs/2125765", depth=1)
+    service.commit_scan(broad["scan_id"])
+    narrow = service.scan("crs/2125765", depth=0, include_assignments=False, include_forums=False)
+    assert narrow["removed"] == [] and "incomplete" not in narrow
+    assert narrow["outside_scope_kept"] >= 3  # sub-folder items, assignments, threads
+    service.commit_scan(narrow["scan_id"])
+    again = service.scan("crs/2125765", depth=1)
+    assert again["new"] == [] and again["removed"] == [] and again["changed"] == []
+
+
+def test_narrower_scan_against_a_baseline_from_0_2(service: IliasService) -> None:
+    service.commit_scan(service.scan("crs/2125765", depth=1)["scan_id"])
+    path = service.snapshots / "2125765.json"
+    data = json.loads(path.read_text("utf-8"))
+    for sig in data["state"].values():
+        sig.pop("_level", None)  # 0.2 recorded only the folder path
+    path.write_text(json.dumps(data), "utf-8")
+    assert service.scan("crs/2125765", depth=0)["removed"] == []
+
+
+def test_news_point_stays_when_the_news_page_fails(service: IliasService, fake, monkeypatch) -> None:
+    def at(day: int) -> None:
+        monkeypatch.setattr(dates, "now_berlin", lambda: datetime(2026, 11, day, 9, 0, tzinfo=dates.BERLIN))
+
+    at(1)
+    service.commit_scan(service.check_all(exclude=["2099965"])["check_id"])
+    at(5)
+    fake.fail_when = lambda request: "ilpdnewsgui" in str(request.url).lower()
+    partial = service.check_all(exclude=["2099965"])
+    assert "committed" not in partial and any("news page" in n for n in partial["notes"])
+    service.commit_scan(partial["check_id"])
+    at(6)
+    fake.fail_when = None
+    later = service.check_all(exclude=["2099965"])
+    assert later["previous_check"].startswith("2026-11-05")
+    assert later["news_compared_with"].startswith("2026-11-01")
+    assert "9900" in [n["news_id"] for n in later["news_since_previous_check"]]  # dated 4 Nov
+
+
+def test_continuation_never_mixes_versions(service: IliasService, fake) -> None:
+    old, new = "a" * 2500, "b" * 2500
+    fake.files["2131799"] = (old.encode(), "notes.txt")
+    first = service.read_file("2131799", max_chars=1000)
+    assert first["continue_with"]["version"]
+
+    fake.files["2131799"] = (new.encode(), "notes.txt")  # updated between the two calls
+    second = service.read_file("2131799", max_chars=1000, **first["continue_with"])
+    assert second["version_changed"] is True
+    assert second["text"][0]["text"] == new[:1000] and "offset" not in second["text"][0]
+
+    # Asking for the end of a version whose beginning was never returned: not read.
+    tail = service.read_file("2131799", pages="1", offset=2000, max_chars=1000)
+    assert tail["text"][0]["note"].startswith("starts in the middle")
+    assert service.read_file("2131799", max_chars=1000).get("status") != "already_read"
 
 
 def test_read_pptx(service: IliasService, fake) -> None:

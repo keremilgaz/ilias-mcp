@@ -52,6 +52,8 @@ else
   echo "   the password goes straight into the Keychain and is never written to a file."
   security add-generic-password -s "$SERVICE" -a "$ILIAS_USER" -l "ILIAS (ilias-mcp)" -w
 fi
+# A cache from version 0.2 or older records no account: asks whether it is this one's.
+.venv/bin/ilias-mcp-config cache --user "$ILIAS_USER" --ask || true
 
 echo
 if [ "$SKIP_CHECK" -eq 1 ]; then

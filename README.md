@@ -168,8 +168,9 @@ To skip that check when running setup again, use `bash setup.sh --skip-check`
 content hash. An unchanged, fully read version returns `already_read`.
 Request specific `pages`, use a keyword `query`, or set `force=true` to read
 it again. A page longer than `max_chars` is cut; the answer then names the
-`pages` and `offset` that continue it, and the page counts as read once its
-end has been returned. “Read” means the text was returned by the tool, not
+`pages`, `offset` and `version` that continue it. If the file changed in
+between, the new version starts again from the beginning of the page. A page
+counts as read only once all of it has been returned for one version. “Read” means the text was returned by the tool, not
 that the user has read it.
 
 **Change detection.** `ilias_scan` compares one course with its last committed
@@ -178,14 +179,19 @@ snapshot, then saves a pending snapshot and returns a `scan_id`. Calling
 The first scan treats all items as new. When part of a course cannot be
 opened, the scan is marked `incomplete`: items it could not reach are listed
 as `not_seen` instead of removed, and committing keeps them in the baseline
-until a complete scan shows whether they still exist. Forum unread counts are
-excluded from the comparison.
+until a complete scan shows whether they still exist. A scan narrower than
+the baseline (smaller `depth`, or without assignments or forums) leaves what it
+did not look at unchanged in the baseline. Forum unread counts are excluded
+from the comparison. `ilias_check_all` compares news with the last check that
+could read the news page, so a check without it does not skip any news.
 
 **Cache.** Reading records, extracted text, snapshots and learned routes are
 kept per ILIAS installation and account, under `accounts/` in the cache
 directory, so two accounts on one computer never share them. A cache from
-version 0.2 or older is moved into the first account that starts. Clearing the
-cache resets the saved history.
+version 0.2 or older does not record its account, so it is not used until you
+say whose it is: the setup script asks, or run
+`ilias-mcp-config cache --user firstname.lastname --adopt`. Clearing the cache
+resets the saved history.
 
 </details>
 
