@@ -154,7 +154,7 @@ To skip that check when running setup again, use `bash setup.sh --skip-check`
 | `ilias_list_courses` | Courses and groups on the dashboard, with semester sections |
 | `ilias_list_items` | Course, folder, or session contents and file metadata; optionally recursive |
 | `ilias_list_assignments` | Assignment deadlines, start dates, submission status, and files |
-| `ilias_read_file` | Extracted file text, selected pages, or keyword snippets |
+| `ilias_read_file` | Extracted file text, selected pages, or keyword snippets; long pages continue with `offset` |
 | `ilias_list_forum_topics` | Thread titles, post counts, and last activity; does not open threads |
 | `ilias_list_news` | Dashboard or course news |
 | `ilias_page_text` | Readable page text as a fallback for announcements or schedules |
@@ -167,18 +167,25 @@ To skip that check when running setup again, use `bash setup.sh --skip-check`
 **Reading records.** `ilias_read_file` tracks returned pages by file ID and
 content hash. An unchanged, fully read version returns `already_read`.
 Request specific `pages`, use a keyword `query`, or set `force=true` to read
-it again. “Read” means the text was returned by the tool, not that the user
-has read it. Records and extracted text are stored under `files/` in the
-cache directory.
+it again. A page longer than `max_chars` is cut; the answer then names the
+`pages` and `offset` that continue it, and the page counts as read once its
+end has been returned. “Read” means the text was returned by the tool, not
+that the user has read it.
 
 **Change detection.** `ilias_scan` compares one course with its last committed
 snapshot, then saves a pending snapshot and returns a `scan_id`. Calling
 `ilias_commit_scan` with that ID replaces the course's comparison baseline.
-The first scan treats all items as new. An inaccessible folder can cause an
-existing item to appear as removed, so check unexpected removals in ILIAS
-and review incomplete scans before committing them. Forum unread counts are
-excluded from the comparison. Snapshots are stored under `snapshots/` in the
-cache directory. Clearing the cache resets the saved history.
+The first scan treats all items as new. When part of a course cannot be
+opened, the scan is marked `incomplete`: items it could not reach are listed
+as `not_seen` instead of removed, and committing keeps them in the baseline
+until a complete scan shows whether they still exist. Forum unread counts are
+excluded from the comparison.
+
+**Cache.** Reading records, extracted text, snapshots and learned routes are
+kept per ILIAS installation and account, under `accounts/` in the cache
+directory, so two accounts on one computer never share them. A cache from
+version 0.2 or older is moved into the first account that starts. Clearing the
+cache resets the saved history.
 
 </details>
 

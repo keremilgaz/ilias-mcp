@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,28 @@ class Settings:
     @property
     def memberships_url(self) -> str:
         return f"{self.base_url}/ilias.php?baseClass=ilmembershipoverviewgui"
+
+    @property
+    def account_dir(self) -> Path:
+        """Cache of this ILIAS installation and account: file texts, reading records,
+        snapshots and routes are never shared between accounts."""
+        slug = re.sub(r"[^a-z0-9._-]+", "_", f"{self.host}-{self.client_id}-{self.username}".lower())
+        return Path(self.cache_dir) / "accounts" / slug
+
+
+_LEGACY = ("files", "snapshots", "routes.json")  # cache layout before 0.3, one account per machine
+
+
+def prepare_cache(settings: Settings) -> Path:
+    """Create the account's cache folder. A cache from before 0.3 (kept directly in
+    cache_dir, without an account) is moved into the first account that starts."""
+    base, target = Path(settings.cache_dir), settings.account_dir
+    if not target.exists():
+        target.mkdir(parents=True)
+        for name in _LEGACY:
+            if (base / name).exists():
+                (base / name).replace(target / name)
+    return target
 
 
 def load_settings() -> Settings:

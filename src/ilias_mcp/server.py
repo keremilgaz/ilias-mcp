@@ -18,7 +18,7 @@ from mcp.types import ToolAnnotations
 
 from . import __version__, dates, parsers
 from .client import BudgetExceeded, IliasClient, IliasError, LoginError
-from .config import Settings, load_settings
+from .config import Settings, load_settings, prepare_cache
 from .credentials import CredentialError
 from .files import FileCache
 from .policy import PolicyViolation
@@ -62,7 +62,7 @@ def get_service() -> IliasService:
     if _service is None:
         _settings = load_settings()
         client = IliasClient(_settings)
-        _service = IliasService(_settings, client, FileCache(Path(_settings.cache_dir) / "files"))
+        _service = IliasService(_settings, client, FileCache(prepare_cache(_settings) / "files"))
     return _service
 
 
@@ -170,16 +170,19 @@ def ilias_read_file(
     query: str | None = None,
     force: bool = False,
     max_chars: int = 15000,
+    offset: int = 0,
 ) -> dict:
     """Text of a course file (PDF, PPTX, DOCX, text, ZIP) by ref_id or download URL.
 
     Without `pages`, returns only pages not read before; an unchanged, fully read
     file returns status 'already_read'. `pages='2-4,7'` re-opens specific pages.
     `query='deadline|due|submit'` returns keyword snippets instead of full text
-    (not counted as read). `force=true` returns everything again.
+    (not counted as read). `force=true` returns everything again. A page longer
+    than max_chars is cut: the answer then has `continue_with` (pages + offset)
+    for the next call.
     """
     return service.read_file(target, pages=pages, query=query, force=force,
-                             max_chars=max(1000, min(max_chars, 60000)))
+                             max_chars=max(1000, min(max_chars, 60000)), offset=max(0, int(offset)))
 
 
 @mcp.tool(annotations=READ_ONLY)

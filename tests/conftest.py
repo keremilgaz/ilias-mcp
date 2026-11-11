@@ -57,6 +57,7 @@ class FakeIlias:
         self.login_posts = 0
         self.files: dict[str, tuple[bytes, str]] = {}
         self.fail_when = None  # optional predicate: answer matching requests with 404
+        self.users = {"max.mustermann"}  # accounts that can log in (all with PASSWORD)
         self.pages = {
             ("/ilias.php", "ildashboardgui", "jumptoselecteditems"): "dashboard.html",
             ("/ilias.php", "ildashboardgui", ""): "news.html",
@@ -85,9 +86,8 @@ class FakeIlias:
         if request.method == "POST":
             self.login_posts += 1
             body = parse_qs(request.content.decode())
-            if body.get("login_form/input_3/input_5") == [PASSWORD] and body.get(
-                "login_form/input_3/input_4"
-            ) == ["max.mustermann"]:
+            user = (body.get("login_form/input_3/input_4") or [""])[0]
+            if body.get("login_form/input_3/input_5") == [PASSWORD] and user in self.users:
                 sid = f"s{len(self.sessions) + 1}"
                 self.sessions.add(sid)
                 return httpx.Response(
@@ -194,4 +194,4 @@ def client(fake: FakeIlias, settings: Settings, sleeps: list[float]) -> IliasCli
 
 @pytest.fixture
 def service(client: IliasClient, settings: Settings) -> IliasService:
-    return IliasService(settings, client, FileCache(settings.cache_dir / "files"))
+    return IliasService(settings, client, FileCache(settings.account_dir / "files"))

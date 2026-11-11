@@ -79,6 +79,64 @@ def test_read_file_detects_new_version(service: IliasService, fake) -> None:
     assert "v2" in second["text"][0]["text"]
 
 
+def test_read_file_continues_a_long_page(service: IliasService, fake) -> None:
+    text = "abcdefghij" * 250  # one 2500-character line: a single page
+    fake.files["2131799"] = (text.encode(), "notes.txt")
+    first = service.read_file("2131799", max_chars=1000)
+    assert first["text"][0]["text"] == text[:1000]
+    assert first["continue_with"] == {"pages": "1", "offset": 1000}
+    assert first["remaining_pages"] == "1"  # not read yet
+
+    second = service.read_file("2131799", max_chars=1000, **first["continue_with"])
+    assert second["text"][0] == {"page": 1, "text": text[1000:2000], "offset": 1000}
+    third = service.read_file("2131799", max_chars=1000, **second["continue_with"])
+    assert third["text"][0]["text"] == text[2000:] and "continue_with" not in third
+    assert service.read_file("2131799")["status"] == "already_read"  # its end was returned
+
+    with pytest.raises(ValueError):
+        service.read_file("2131799", pages="1", offset=5000)
+
+
+def test_cache_is_separate_per_account(service: IliasService, fake, settings, client) -> None:
+    from dataclasses import replace
+
+    from ilias_mcp.client import IliasClient
+    from ilias_mcp.files import FileCache
+
+    fake.files["2131745"] = (make_pdf(["Max's copy"]), "org.pdf")
+    service.crawl("crs/2125765")
+    assert "Max's copy" in service.read_file("2131745")["text"][0]["text"]
+
+    fake.users.add("erika.musterfrau")
+    other_settings = replace(settings, username="erika.musterfrau")  # same cache_dir
+    other_client = IliasClient(other_settings, transport=httpx.MockTransport(fake),
+                               password_provider=lambda: conftest.PASSWORD, sleep=lambda s: None)
+    other = IliasService(other_settings, other_client, FileCache(other_settings.account_dir / "files"))
+    fake.files["2131745"] = (make_pdf(["Erika's copy"]), "org.pdf")
+    other.crawl("crs/2125765")  # same ref_id and listing as Max's
+    result = other.read_file("2131745")
+    assert result["source"] == "downloaded" and "Erika's copy" in result["text"][0]["text"]
+    assert other_settings.account_dir != settings.account_dir
+    assert other.scan("crs/2125765")["note"].startswith("first scan")  # no shared snapshots
+
+
+def test_prepare_cache_moves_the_old_layout(tmp_path) -> None:
+    from ilias_mcp.config import Settings, prepare_cache
+
+    base = tmp_path / "cache"
+    (base / "files").mkdir(parents=True)
+    (base / "files" / "index.json").write_text("{}", "utf-8")
+    (base / "snapshots" / "pending").mkdir(parents=True)
+    (base / "routes.json").write_text("{}", "utf-8")
+    first = Settings(username="Kerem.Ilgaz", cache_dir=base)
+    target = prepare_cache(first)
+    assert target.name == "ilias.uni-konstanz.de-iliaskonstanz-kerem.ilgaz"
+    assert (target / "files" / "index.json").exists() and (target / "routes.json").exists()
+    assert not (base / "files").exists() and not (base / "snapshots").exists()
+    second = prepare_cache(Settings(username="someone.else", cache_dir=base))
+    assert list(second.iterdir()) == []  # a second account starts empty
+
+
 def test_read_pptx(service: IliasService, fake) -> None:
     fake.files["2131770"] = (make_pptx(["Agenda", "Tool use"]), "L3.pptx")
     result = service.read_file("2131770")
@@ -129,15 +187,51 @@ def test_download_stays_inside_root(service: IliasService, fake, settings) -> No
         service.download_file("2131745", "../../escape")
 
 
-def test_incomplete_scan_is_flagged(service: IliasService, fake) -> None:
+def test_incomplete_scan_keeps_the_baseline(service: IliasService, fake) -> None:
     baseline = service.scan("crs/2125765", depth=1)
     assert "incomplete" not in baseline
     service.commit_scan(baseline["scan_id"])
-    del fake.ref_pages["2131737"]  # the folder now fails to load
+
+    folder_page = fake.ref_pages.pop("2131737")  # the folder now fails to load
     later = service.scan("crs/2125765", depth=1)
     assert later["incomplete"] is True
     assert any("Lecture Content" in n for n in later["notes"])
-    assert "item:2131770" in {r["key"] for r in later["removed"]}  # why the warning matters
+    assert later["removed"] == []  # cannot tell deleted from unreachable
+    assert "item:2131770" in {r["key"] for r in later["not_seen"]}
+    assert service.commit_scan(later["scan_id"])["kept_unseen"] == len(later["not_seen"])
+
+    fake.ref_pages["2131737"] = folder_page  # the folder opens again
+    again = service.scan("crs/2125765", depth=1)
+    assert "incomplete" not in again
+    assert again["new"] == [] and again["removed"] == [] and again["changed"] == []
+
+
+def test_complete_scan_still_reports_removals(service: IliasService, fake, monkeypatch) -> None:
+    baseline = service.scan("crs/2125765", depth=1)
+    service.commit_scan(baseline["scan_id"])
+    folder = conftest.fixture("folder.html")
+    assert "2131770" in folder
+    real_fixture = conftest.fixture
+    # The folder still opens but no longer lists anything: a real removal.
+    monkeypatch.setattr(conftest, "fixture",
+                        lambda name: "<html><body></body></html>" if name == "folder.html" else real_fixture(name))
+    later = service.scan("crs/2125765", depth=1)
+    assert "incomplete" not in later
+    assert "item:2131770" in {r["key"] for r in later["removed"]}
+
+
+def test_check_all_with_unreachable_folder(service: IliasService, fake) -> None:
+    first = service.check_all(exclude=["2099965"])
+    service.commit_scan(first["check_id"])
+    folder_page = fake.ref_pages.pop("2131737")
+    second = service.check_all(exclude=["2099965"])
+    course = second["courses_with_changes"][0]
+    assert course["incomplete"] is True and "removed" not in course and course["not_seen"]
+    assert "committed" not in second  # incomplete: left to the caller
+    service.commit_scan(second["check_id"])
+    fake.ref_pages["2131737"] = folder_page
+    third = service.check_all(exclude=["2099965"])
+    assert third["courses_with_changes"] == [] and third["committed"] is True
 
 
 def test_learned_routes_skip_the_goto_redirect(service: IliasService, fake) -> None:
@@ -173,6 +267,8 @@ def test_check_all_reports_only_changes(service: IliasService, fake, monkeypatch
     first = service.check_all(exclude=["crs/2099965"])
     assert first["semester"] == "Winter semester 2026"
     assert first["excluded"] == ["2099965"]
+    # Same source as ilias_list_news: the dashboard's news page, not the dashboard itself.
+    assert [n["news_id"] for n in first["news_since_previous_check"]] == ["9911", "9900"]
     assert [c["ref_id"] for c in first["courses_with_changes"]] == ["2125765"]  # first scan: all new
     assert [d["title"] for d in first["upcoming_deadlines_14_days"]] == ["Assignment 3: Literature Review"]
     service.commit_scan(first["check_id"])

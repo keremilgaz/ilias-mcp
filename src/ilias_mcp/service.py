@@ -76,13 +76,13 @@ class IliasService:
         self.settings = settings
         self.client = client
         self.cache = cache
-        self.snapshots = Path(settings.cache_dir) / "snapshots"
+        self.snapshots = settings.account_dir / "snapshots"
         (self.snapshots / "pending").mkdir(parents=True, exist_ok=True)
         # File listings seen in this process; trusted to skip a re-download.
         self._fresh_listing: dict[str, dict] = {}
         # Direct ilias.php routes per object type, learned from goto redirects.
         # Using them skips the redirect hop: one request per page instead of two.
-        self._routes_path = Path(settings.cache_dir) / "routes.json"
+        self._routes_path = settings.account_dir / "routes.json"
         self._routes: dict[str, dict] = self._load_routes()
 
     # -- routes ------------------------------------------------------------------
@@ -157,7 +157,7 @@ class IliasService:
             "requests_this_process": self.client.requests_total,
             "min_seconds_between_requests": self.settings.min_interval,
             "max_requests_per_call": self.settings.max_requests_per_call,
-            "cache_dir": str(self.settings.cache_dir),
+            "cache_dir": str(self.settings.account_dir),
             "download_root": str(self.settings.download_root),
             "policy": self.client.policy.describe(),
         }
@@ -302,18 +302,18 @@ class IliasService:
         return result
 
     def news(self, target: str | None = None) -> dict:
-        if target:
-            page = self._open(target)
-        else:
-            dash = self.client.get_page(self.settings.dashboard_url)
-            link = parsers.find_link(dash.html, dash.url, r"ilpdnewsgui")
-            page = self.client.get_page(link) if link else dash
+        page = self._open(target) if target else self._news_page(self.client.get_page(self.settings.dashboard_url))
         items = parsers.parse_news(page.html, page.url)
         result: dict[str, Any] = {"source": parsers.page_title(page.html), "url": page.url, "news": items}
         if not items:
             result["hint"] = "no news items recognised; page text follows"
             result["text"] = parsers.page_text(page.html)[:6000]
         return result
+
+    def _news_page(self, dash: Page) -> Page:
+        """The dashboard's news page; the dashboard itself shows only a few items, if any."""
+        link = parsers.find_link(dash.html, dash.url, r"ilpdnewsgui")
+        return self.client.get_page(link) if link else dash
 
     # -- files -------------------------------------------------------------------
 
@@ -337,6 +337,7 @@ class IliasService:
         query: str | None = None,
         force: bool = False,
         max_chars: int = 15000,
+        offset: int = 0,
     ) -> dict:
         key, urls = self._file_key_and_urls(target)
         listing = self._fresh_listing.get(key)
@@ -397,20 +398,37 @@ class IliasService:
                 return result
             selected = unread if not force else list(range(1, total + 1))
 
+        # `offset` continues a page that was cut off (one long page: a text file, a
+        # ZIP listing, a dense slide). It applies to the first selected page.
+        if offset and selected and (offset < 0 or offset >= len(texts[selected[0] - 1])):
+            raise ValueError(f"offset {offset} is outside page {selected[0]} "
+                             f"({len(texts[selected[0] - 1])} characters)")
         returned: list[dict] = []
         budget = max_chars
+        cut: dict | None = None
         for number in selected:
             text = texts[number - 1]
-            if returned and len(text) > budget:
+            start = offset if not returned else 0
+            if returned and len(text) - start > budget:
                 break
-            returned.append({"page": number, "text": text[:budget]})
-            budget -= len(text)
-        done = [r["page"] for r in returned if len(r["text"]) == len(texts[r["page"] - 1])]
+            chunk = text[start:start + budget]
+            returned.append({"page": number, "text": chunk} | ({"offset": start} if start else {}))
+            budget -= len(chunk)
+            if start + len(chunk) < len(text):
+                cut = {"page": number, "next_offset": start + len(chunk), "page_chars": len(text)}
+                break
+        # A page counts as read once its end has been returned.
+        done = [r["page"] for r in returned
+                if r.get("offset", 0) + len(r["text"]) == len(texts[r["page"] - 1])]
         self.cache.mark_read(key, entry["sha256"], done)
         remaining = [p for p in selected if p not in done]
         result["returned_pages"] = compact_ranges([r["page"] for r in returned])
         if remaining:
             result["remaining_pages"] = compact_ranges(remaining)
+        if cut:
+            result["continue_with"] = {"pages": str(cut["page"]), "offset": cut["next_offset"]}
+            result["hint"] = (f"page {cut['page']} was cut at character {cut['next_offset']} of "
+                              f"{cut['page_chars']}; call again with continue_with's pages and offset")
         result["text"] = returned
         return result
 
@@ -498,10 +516,22 @@ class IliasService:
             for k, v in state.items()
             if k in before and strip(before[k]) != strip(v)
         }
-        removed = {k: strip(v) for k, v in before.items() if k not in state}
+        if crawl.get("truncated"):
+            notes.append(crawl["truncated"])
+        notes.extend(f"could not open {e}" for e in crawl.get("errors", []))
+        missing = {k: strip(v) for k, v in before.items() if k not in state}
+        # An incomplete scan cannot tell a deleted item from one it could not reach.
+        # Unseen items stay in the baseline (so they do not come back as "new" once
+        # the folder opens again) and are reported as not seen instead of removed.
+        incomplete = bool(notes)
+        removed = {} if incomplete else missing
+        not_seen = missing if incomplete else {}
+        saved_state = {**{k: before[k] for k in not_seen}, **state}
         scan_id = uuid.uuid4().hex[:12]
-        pending = {"target": course_ref, "title": crawl["page"]["title"], "state": state,
+        pending = {"target": course_ref, "title": crawl["page"]["title"], "state": saved_state,
                    "scanned_at": dates.now_berlin().isoformat(timespec="minutes")}
+        if incomplete:
+            pending["kept_unseen"] = len(not_seen)
         (self.snapshots / "pending" / f"{scan_id}.json").write_text(
             json.dumps(pending, ensure_ascii=False), "utf-8"
         )
@@ -524,16 +554,14 @@ class IliasService:
         }
         if previous is None:
             result["note"] = "first scan of this course: everything is listed as new"
-        if crawl.get("truncated"):
-            notes.append(crawl["truncated"])
-        notes.extend(f"could not open {e}" for e in crawl.get("errors", []))
-        if notes:
+        if incomplete:
             result["notes"] = notes
-            # Parts of the course were not read, so "removed" may be wrong.
             result["incomplete"] = True
+            result["not_seen"] = [{"key": k, **v} for k, v in not_seen.items()]
             result["warning"] = (
-                "incomplete scan: items under the parts listed in 'notes' may show up as "
-                "removed. Check before committing."
+                f"incomplete scan (see 'notes'): {len(not_seen)} item(s) of the last baseline were "
+                "not reached. They are listed under 'not_seen', not as removed, and committing keeps "
+                "them in the baseline until a complete scan confirms whether they still exist."
             )
         return result
 
@@ -551,7 +579,10 @@ class IliasService:
         target = self.snapshots / f"{pending['target']}.json"
         target.write_text(json.dumps(pending, ensure_ascii=False), "utf-8")
         pending_path.unlink()
-        return {"committed": scan_id, "course": pending.get("title"), "baseline_from": pending["scanned_at"]}
+        result = {"committed": scan_id, "course": pending.get("title"), "baseline_from": pending["scanned_at"]}
+        if pending.get("kept_unseen"):
+            result["kept_unseen"] = pending["kept_unseen"]  # carried over from the previous baseline
+        return result
 
     # -- one call for the whole semester -------------------------------------------
 
@@ -574,7 +605,15 @@ class IliasService:
         excluded = {str(x).strip().split("/")[-1].split("_")[-1] for x in exclude}
         targets = [i for i in entries
                    if (chosen is None or i.get("section") == chosen) and i["ref_id"] not in excluded]
-        news = parsers.parse_news(dash.html, dash.url)
+        news_notes: list[str] = []
+        try:
+            news_page = self._news_page(dash)  # same source as ilias_list_news
+        except (LoginError, BudgetExceeded):
+            raise
+        except (IliasError, PolicyViolation) as exc:
+            news_page = dash
+            news_notes.append(f"news page could not be opened ({exc}); only dashboard news checked")
+        news = parsers.parse_news(news_page.html, news_page.url)
         last_check = self._last_check()
 
         courses: list[dict] = []
@@ -595,7 +634,8 @@ class IliasService:
             scan_ids.append(scan["scan_id"])
             entry = {"course": scan["course"], "ref_id": scan["ref_id"],
                      "changes": len(scan["new"]) + len(scan["changed"]) + len(scan["removed"])}
-            for key in ("new", "changed", "removed", "notes", "incomplete", "warning", "note", "compared_with"):
+            for key in ("new", "changed", "removed", "not_seen", "notes", "incomplete", "warning", "note",
+                        "compared_with"):
                 if scan.get(key):
                     entry[key] = scan[key]
             courses.append(entry)
@@ -615,7 +655,7 @@ class IliasService:
         quiet = [c["course"] for c in courses if c not in attention]
         # Nothing to record: make this the baseline right away, so a quiet check
         # needs no further tool call (and no further approval) from the client.
-        nothing_new = not attention and not fresh_news and bool(courses)
+        nothing_new = not attention and not fresh_news and not news_notes and bool(courses)
         if nothing_new and auto_commit:
             self.commit_scan(check_id)
         result = {
@@ -632,6 +672,8 @@ class IliasService:
             "news_since_previous_check": fresh_news,
             "requests_used": self.client.call_requests,
         }
+        if news_notes:
+            result["notes"] = news_notes
         if nothing_new and auto_commit:
             result["committed"] = True
             result["next_step"] = "nothing changed; already saved as the new baseline"

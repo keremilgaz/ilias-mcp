@@ -17,7 +17,7 @@ from pathlib import Path
 
 from . import __version__, parsers
 from .client import IliasClient
-from .config import load_settings
+from .config import load_settings, prepare_cache
 from .files import FileCache
 from .service import IliasService
 
@@ -39,7 +39,7 @@ def main() -> None:
 
     settings = load_settings()
     client = IliasClient(settings)
-    service = IliasService(settings, client, FileCache(Path(settings.cache_dir) / "files"))
+    service = IliasService(settings, client, FileCache(prepare_cache(settings) / "files"))
     report: dict = {"version": __version__, "base_url": settings.base_url, "steps": []}
     dump = Path(args.dump) if args.dump else None
     if dump:
@@ -65,7 +65,8 @@ def main() -> None:
         try:
             with client.call_scope(80):
                 entry["result"] = fn()
-            entry["ok"] = "error" not in entry["result"]
+            # A crawl that could not open part of a course is a failure too, not a pass.
+            entry["ok"] = "error" not in entry["result"] and not entry["result"].get("errors")
         except Exception as exc:
             entry["ok"] = False
             entry["error"] = f"{type(exc).__name__}: {exc}"
