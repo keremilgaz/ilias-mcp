@@ -44,6 +44,26 @@ Quit Claude completely with **Cmd+Q**, open it again, and try:
 
 > List my courses on ILIAS.
 
+## Get started on Windows
+
+You will need the same: the **Claude desktop app**, your **ILIAS login**,
+**Git**, and **Python 3.10+** from [python.org](https://www.python.org/downloads/)
+(or `winget install Python.Python.3.12`).
+
+Open PowerShell and run:
+
+```powershell
+git clone https://github.com/keremilgaz/ilias-mcp.git
+cd ilias-mcp
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+The prompts are the same as on macOS; your password is saved in **Windows
+Credential Manager**. `-ExecutionPolicy Bypass` applies to this one run only.
+Then quit Claude from its tray icon (closing the window is not enough), open
+it again, and try the same question. Windows support is new: if something
+fails, please open an issue.
+
 ## How does it work?
 
 The program runs on your computer and retrieves ILIAS pages or files when
@@ -57,7 +77,8 @@ other MCP clients is included below.
 
 ## Your account and course data
 
-- Your password stays in **macOS Keychain**, outside the AI configuration.
+- Your password stays in **macOS Keychain** or **Windows Credential Manager**,
+  outside the AI configuration.
 - Saved checks and extracted file text are cached on your computer.
 - Retrieved content is shared with your **AI application** and may reach its
   cloud model provider. Local installation does not make the AI processing local.
@@ -91,8 +112,24 @@ manual setup, replace the example paths and username with your own:
 }
 ```
 
+On Windows the command is `C:\\Users\\<you>\\ilias-mcp\\.venv\\Scripts\\ilias-mcp.exe`
+(backslashes doubled in JSON). `ilias-mcp-config add --user firstname.lastname --dry-run`,
+run from the virtualenv, prints the exact entry for your computer; without
+`--dry-run` it adds it, keeping your other servers and making a backup.
+
+| System | Location of `claude_desktop_config.json` |
+|---|---|
+| macOS | `~/Library/Application Support/Claude/` |
+| Windows | `%APPDATA%\Claude\`; Microsoft Store version: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\` |
+
+On Windows and Linux the password is read through
+[`keyring`](https://pypi.org/project/keyring/); save it with
+`.venv\Scripts\python -m keyring set ilias-mcp firstname.lastname`
+(Linux: `.venv/bin/python`). Linux needs a running Secret Service such as GNOME Keyring.
+
 If setup reports a failed connection check, inspect `selftest-report.json`.
-To skip that check when running setup again, use `bash setup.sh --skip-check`.
+To skip that check when running setup again, use `bash setup.sh --skip-check`
+(Windows: `setup.ps1 -SkipCheck`).
 
 | Variable | Default |
 |---|---|
@@ -104,7 +141,7 @@ To skip that check when running setup again, use `bash setup.sh --skip-check`.
 | `ILIAS_MAX_REQUESTS_PER_CALL` | `60`; `ilias_scan` uses `120`, `ilias_check_all` `400` |
 | `ILIAS_TIMEOUT` | `30.0` seconds |
 | `ILIAS_KEYCHAIN_SERVICE` | `ilias-mcp` |
-| `ILIAS_CACHE_DIR` | `~/Library/Caches/ilias-mcp` on macOS |
+| `ILIAS_CACHE_DIR` | `~/Library/Caches/ilias-mcp` on macOS, `%LOCALAPPDATA%\ilias-mcp\Cache` on Windows |
 | `ILIAS_DOWNLOAD_ROOT` | `~/Documents/ILIAS` |
 
 </details>
@@ -168,13 +205,14 @@ The code separates ILIAS access from the MCP interface:
 src/ilias_mcp/
   policy.py       Request checks
   client.py       HTTP requests, login, sessions, rate limits, and budgets
-  credentials.py  Keychain access
+  credentials.py  Keychain / Credential Manager access
   parsers.py      HTML parsing
   dates.py        German/English dates in Europe/Berlin
   files.py        Text extraction and reading records
   service.py      Course scanning, comparisons, reading, and downloads
   server.py       MCP tools over stdio
   check.py        Live connection self-test
+  install.py      Claude configuration (ilias-mcp-config)
 tests/           Fake ILIAS server and HTML fixtures
 ```
 
@@ -184,6 +222,8 @@ To run the development tests:
 .venv/bin/pip install -e ".[dev]"
 .venv/bin/pytest
 ```
+
+On Windows, use `.venv\Scripts\pip` and `.venv\Scripts\pytest`.
 
 Tests use `httpx.MockTransport` and HTML fixtures. They cover request checks,
 login and re-login, redirects, rate limits, parsing, reading records, change

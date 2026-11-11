@@ -231,7 +231,7 @@ class FileCache:
             try:
                 self.index = json.loads(self.index_path.read_text("utf-8"))
             except (OSError, ValueError):
-                self.index_path.rename(self.index_path.with_suffix(".corrupt.json"))
+                self.index_path.replace(self.index_path.with_suffix(".corrupt.json"))
         self.index.setdefault("files", {})
 
     def _save(self) -> None:

@@ -423,7 +423,7 @@ class IliasService:
         key, urls = self._file_key_and_urls(target)
         download = self.client.get_file(urls)
         self.cache.store(key, download.content, download.filename, self._fresh_listing.get(key))
-        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", download.filename or f"ilias-{key}.bin").strip() or "file"
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", download.filename or f"ilias-{key}.bin").strip().rstrip(".") or "file"
         dest.mkdir(parents=True, exist_ok=True)
         path = dest / name
         digest = hashlib.sha256(download.content).hexdigest()
@@ -561,8 +561,12 @@ class IliasService:
         section: str | None = None,
         depth: int = 1,
         progress: Callable[[dict], None] | None = None,
+        auto_commit: bool = True,
     ) -> dict:
-        """Scan every course of the current semester and return only what changed."""
+        """Scan every course of the current semester and return only what changed.
+
+        With ``auto_commit`` a check that found nothing new commits itself.
+        """
         dash = self.client.get_page(self.settings.dashboard_url)
         entries = [i for i in parsers.parse_items(dash.html, dash.url)
                    if i["type"] in ("crs", "grp") and i.get("ref_id")]
@@ -609,7 +613,12 @@ class IliasService:
 
         attention = [c for c in courses if c.get("changes") or c.get("error") or c.get("incomplete")]
         quiet = [c["course"] for c in courses if c not in attention]
-        return {
+        # Nothing to record: make this the baseline right away, so a quiet check
+        # needs no further tool call (and no further approval) from the client.
+        nothing_new = not attention and not fresh_news and bool(courses)
+        if nothing_new and auto_commit:
+            self.commit_scan(check_id)
+        result = {
             "check_id": check_id,
             "checked_at": now.isoformat(timespec="minutes"),
             "previous_check": last_check,
@@ -622,8 +631,13 @@ class IliasService:
             "upcoming_deadlines_14_days": upcoming,
             "news_since_previous_check": fresh_news,
             "requests_used": self.client.call_requests,
-            "next_step": "record the findings, then ilias_commit_scan(check_id)",
         }
+        if nothing_new and auto_commit:
+            result["committed"] = True
+            result["next_step"] = "nothing changed; already saved as the new baseline"
+        else:
+            result["next_step"] = "record the findings, then ilias_commit_scan(check_id)"
+        return result
 
     def _last_check(self) -> str | None:
         path = self.snapshots / "last-check.json"

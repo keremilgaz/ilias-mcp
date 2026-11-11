@@ -11,6 +11,8 @@ from pathlib import Path
 def _default_cache_dir() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Caches" / "ilias-mcp"
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "ilias-mcp" / "Cache"
     return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ilias-mcp"
 
 

@@ -6,7 +6,10 @@
 #   bash setup.sh --skip-check  skip the live self-test (e.g. when only changing the config)
 set -euo pipefail
 cd "$(dirname "$0")"
-DIR="$(pwd)"
+if [ "$(uname)" != "Darwin" ]; then
+  echo "setup.sh is for macOS. On Windows, run setup.ps1; elsewhere, see 'Manual setup' in the README."
+  exit 1
+fi
 SERVICE="ilias-mcp"
 SKIP_CHECK=0
 [ "${1:-}" = "--skip-check" ] && SKIP_CHECK=1
@@ -68,31 +71,10 @@ echo "== 4/4 Claude desktop app"
 DEFAULT_ROOT="$HOME/Documents/ILIAS"
 read -r -p "   Folder that ilias_download_file may write to [$DEFAULT_ROOT]: " DOWNLOAD_ROOT
 DOWNLOAD_ROOT="${DOWNLOAD_ROOT:-$DEFAULT_ROOT}"
-CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 read -r -p "   Add the 'ilias' server to the Claude configuration? (a backup is made first) [y/N] " ANSWER
 if [[ "$ANSWER" =~ ^[yYeE] ]]; then
-  .venv/bin/python - "$CONFIG" "$DIR" "$ILIAS_USER" "$DOWNLOAD_ROOT" <<'PY'
-import json, pathlib, shutil, sys, time
-
-path, root, user, download_root = pathlib.Path(sys.argv[1]), *sys.argv[2:5]
-data = {}
-if path.exists():
-    backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-    shutil.copy2(path, backup)
-    print(f"   backup: {backup}")
-    text = path.read_text("utf-8").strip()
-    data = json.loads(text) if text else {}
-path.parent.mkdir(parents=True, exist_ok=True)
-data.setdefault("mcpServers", {})["ilias"] = {
-    "command": f"{root}/.venv/bin/ilias-mcp",
-    "env": {"ILIAS_USER": user, "ILIAS_DOWNLOAD_ROOT": download_root},
-}
-path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", "utf-8")
-print(f"   added: {path}")
-PY
+  .venv/bin/ilias-mcp-config add --user "$ILIAS_USER" --download-root "$DOWNLOAD_ROOT"
   echo "   Quit the Claude app completely (Cmd+Q) and open it again."
 else
-  echo "   Not added. To add it by hand, put this under \"mcpServers\" in claude_desktop_config.json:"
-  echo "     \"ilias\": {\"command\": \"$DIR/.venv/bin/ilias-mcp\","
-  echo "               \"env\": {\"ILIAS_USER\": \"$ILIAS_USER\", \"ILIAS_DOWNLOAD_ROOT\": \"$DOWNLOAD_ROOT\"}}"
+  .venv/bin/ilias-mcp-config add --user "$ILIAS_USER" --download-root "$DOWNLOAD_ROOT" --dry-run
 fi

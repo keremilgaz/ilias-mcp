@@ -250,7 +250,7 @@ async def ilias_check_all(
     exclude: list[str] | None = None,
     section: str | None = None,
     depth: int = 1,
-    wait_seconds: int = 40,
+    wait_seconds: int = 50,
 ) -> dict:
     """Check every course of the current semester in one go and return only what changed
     since the last committed check: new/changed/removed files, assignments, forum threads
@@ -259,7 +259,9 @@ async def ilias_check_all(
     The semester is the newest dashboard section unless `section` is given; `exclude`
     takes ref_ids ('2101331' or 'crs/2101331') of courses to skip. The check runs in the
     background: if the answer is status 'running', call this tool again to keep waiting
-    (it does not start a second check). Afterwards call ilias_commit_scan(check_id).
+    (it does not start a second check). If nothing changed, the check is saved as the new
+    baseline automatically ('committed': true); otherwise record the findings and then call
+    ilias_commit_scan(check_id).
     """
 
     def work() -> dict:

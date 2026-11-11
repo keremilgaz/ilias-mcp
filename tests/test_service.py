@@ -121,7 +121,7 @@ def test_download_stays_inside_root(service: IliasService, fake, settings) -> No
     fake.files["2131745"] = (make_pdf(["x"]), "org.pdf")
     saved = service.download_file("2131745", "Agentic AI/ilias")
     path = Path(saved["saved_to"])
-    assert path.exists() and settings.download_root in path.parents
+    assert path.exists() and settings.download_root.resolve() in path.parents
     assert service.download_file("2131745", "Agentic AI/ilias")["status"] == "already_present"
     with pytest.raises(ValueError):
         service.download_file("2131745", "/tmp/elsewhere")
@@ -177,12 +177,15 @@ def test_check_all_reports_only_changes(service: IliasService, fake, monkeypatch
     assert [d["title"] for d in first["upcoming_deadlines_14_days"]] == ["Assignment 3: Literature Review"]
     service.commit_scan(first["check_id"])
 
+    assert "committed" not in first  # changes found: the caller commits after recording
+
     second = service.check_all(exclude=["2099965"])
     assert second["courses_with_changes"] == []
     assert second["unchanged_courses"] == ["Advances in Agentic AI"]
     assert second["previous_check"] == first["checked_at"]
+    assert second["committed"] is True  # quiet check: saved without another call
     with pytest.raises(ValueError):
-        service.commit_scan(first["check_id"])  # already committed
+        service.commit_scan(second["check_id"])  # already committed
 
 
 def test_page_state_adopted_for_old_baselines(service: IliasService) -> None:
@@ -190,8 +193,8 @@ def test_page_state_adopted_for_old_baselines(service: IliasService) -> None:
     scan = service.scan("crs/2125765", depth=0)
     service.commit_scan(scan["scan_id"])
     path = service.snapshots / "2125765.json"
-    data = _json.loads(path.read_text())
+    data = _json.loads(path.read_text("utf-8"))
     data["state"] = {k: v for k, v in data["state"].items() if not k.startswith("page:")}
-    path.write_text(_json.dumps(data))  # what a baseline from version 0.1 looks like
+    path.write_text(_json.dumps(data), "utf-8")  # what a baseline from version 0.1 looks like
     again = service.scan("crs/2125765", depth=0)
     assert again["new"] == []

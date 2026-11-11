@@ -25,9 +25,9 @@ def test_selftest_report_and_redacted_dump(fake, tmp_path, monkeypatch) -> None:
     with pytest.raises(SystemExit) as done:
         check.main()
     assert done.value.code == 0
-    report = json.loads(report_path.read_text())
+    report = json.loads(report_path.read_text("utf-8"))
     assert [s["step"] for s in report["steps"]][:2] == ["list_courses", "list_items crs/2125765"]
     assert all(s["ok"] for s in report["steps"])
-    dumped = "".join(p.read_text() for p in dump.glob("*.html"))
+    dumped = "".join(p.read_text("utf-8") for p in dump.glob("*.html"))
     assert "rtoken=abc123" not in dumped and "rtoken=REDACTED" in dumped
-    assert PASSWORD not in report_path.read_text() + dumped
+    assert PASSWORD not in report_path.read_text("utf-8") + dumped
