@@ -9,12 +9,20 @@ import time
 import webbrowser
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from typing import Callable
 from urllib.parse import parse_qs
 
 
 class SetupError(RuntimeError):
     pass
+
+
+class _LoopbackHTTPServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        # HTTPServer resolves its hostname on bind. Setup uses a numeric loopback address.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def _page(body: str) -> bytes:
@@ -141,7 +149,7 @@ Your password is stored in your system credential store.</p>
         except (OSError, webbrowser.Error):
             pass  # The address is also printed for manual opening.
 
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+    with _LoopbackHTTPServer(("127.0.0.1", 0), Handler) as server:
         server.timeout = 0.25
         host = f"127.0.0.1:{server.server_port}"
         origin = f"http://{host}"

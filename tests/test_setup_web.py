@@ -1,3 +1,4 @@
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from urllib.parse import urlsplit
@@ -8,6 +9,10 @@ from ilias_mcp import setup_web
 
 
 def test_browser_setup_accepts_only_its_form_and_does_not_echo_password(monkeypatch) -> None:
+    def unexpected_lookup(*_args: object) -> str:
+        raise AssertionError("The loopback server should start without reverse DNS")
+
+    monkeypatch.setattr(socket, "getfqdn", unexpected_lookup)
     addresses: Queue[str] = Queue()
     monkeypatch.setattr(setup_web.webbrowser, "open", addresses.put)
     saved = []
