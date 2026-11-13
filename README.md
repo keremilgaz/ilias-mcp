@@ -30,9 +30,9 @@ your question.
 
 The assistant checks every course of the current semester in one go. It
 reports only new or changed files, assignments, forum topics and
-announcements, plus deadlines in the next 14 days. After you have noted what
-matters, it saves the check, so next week's check starts from there. The very
-first check lists everything as new.
+announcements, plus deadlines in the next 14 days. Approve saving the check
+in the ILIAS card to use it as next week's baseline. The very first check lists
+everything as new.
 
 **Deadlines at a glance.**
 
@@ -276,8 +276,8 @@ when you need HTML for debugging.
 | `ilias_page_text` | Readable page text as a fallback for announcements or schedules |
 | `ilias_check_all` | All courses of the current semester in one call: only what changed, deadlines in the next 14 days, and new news. Runs in the background; call again while it reports `running` |
 | `ilias_scan` | New, changed, and removed items compared with the saved course state |
-| `ilias_commit_scan` | Saves a scan, or a whole check by its `check_id`, as the reference for the next comparison |
-| `ilias_download_file` | Saves a file under the configured download folder without replacing a different file |
+| `ilias_commit_scan` | Opens an approval card to save a scan or a whole check by its `check_id` as the next comparison baseline |
+| `ilias_download_file` | Opens an approval card to save a file under the configured download folder without replacing a different file |
 | `ilias_status` | Configuration, login state, request counter, and request policy |
 
 **Reading records.** `ilias_read_file` tracks returned pages by file ID and
@@ -291,7 +291,11 @@ that the user has read it.
 
 **Change detection.** `ilias_scan` compares one course with its last committed
 snapshot, then saves a pending snapshot and returns a `scan_id`. Calling
-`ilias_commit_scan` with that ID replaces the course's comparison baseline.
+`ilias_commit_scan` with that ID opens a card to approve replacing the course's
+comparison baseline. File downloads show the source and destination folder.
+These actions require a host with MCP Apps support. In Claude Desktop, use
+**Onayla** or **Reddet** on the card. Each card expires after five minutes and
+can be used once. Portal reads and internal cache bookkeeping continue without a card.
 The first scan treats all items as new. When part of a course cannot be
 opened, the scan is marked `incomplete`: items it could not reach are listed
 as `not_seen` instead of removed, and committing keeps them in the baseline
@@ -439,9 +443,9 @@ Asistan bilgileri ilias-mcp üzerinden alır ve sorunu yanıtlamak için kullan�
 
 Asistan bu dönemin bütün derslerini tek seferde kontrol eder. Yalnızca yeni ya
 da değişmiş dosyaları, ödevleri, forum başlıklarını ve duyuruları, ayrıca
-önümüzdeki 14 gün içindeki son tarihleri raporlar. Önemli olanları not
-ettikten sonra kontrolü kaydeder; gelecek haftaki kontrol oradan başlar. İlk
-kontrol her şeyi yeni olarak listeler.
+önümüzdeki 14 gün içindeki son tarihleri raporlar. Gelecek haftanın başlangıç
+noktası olarak kaydetmek için kontrolü ILIAS kartında onayla. İlk kontrol her
+şeyi yeni olarak listeler.
 
 **Son tarihlere toplu bakış.**
 
@@ -478,8 +482,8 @@ hiçbir şey okunmuş olarak işaretlenmez.
 
 > Bu dersin yeni slaytlarını ILIAS klasörümde "İstatistik" altına indir.
 
-Dosyalar yalnızca ayarlanan indirme klasörünün içine kaydedilir; aynı adı
-taşıyan farklı bir dosyanın üzerine asla yazılmaz.
+İndirme hedefini ILIAS kartında inceleyip onayla. Dosyalar ayarlanan indirme
+klasörüne kaydedilir ve aynı adı taşıyan farklı dosyalar korunur.
 
 **Sınav hazırlığı.**
 
@@ -681,9 +685,9 @@ deine Frage.
 
 Der Assistent prüft alle Kurse des aktuellen Semesters in einem Durchgang. Er
 meldet nur neue oder geänderte Dateien, Aufgaben, Forenthemen und
-Ankündigungen sowie Fristen in den nächsten 14 Tagen. Wenn du das Wichtige
-notiert hast, speichert er den Abgleich; der Abgleich nächste Woche setzt dort
-an. Der allererste Abgleich listet alles als neu auf.
+Ankündigungen sowie Fristen in den nächsten 14 Tagen. Bestätige das Speichern
+in der ILIAS-Karte, um den Abgleich als Ausgangspunkt für nächste Woche zu
+verwenden. Der allererste Abgleich listet alles als neu auf.
 
 **Fristen auf einen Blick.**
 
@@ -720,8 +724,8 @@ werden nicht geöffnet, daher wird nichts als gelesen markiert.
 
 > Lade die neuen Folien dieses Kurses in meinen ILIAS-Ordner unter „Statistik“ herunter.
 
-Dateien werden nur innerhalb deines eingestellten Download-Ordners gespeichert;
-eine andere Datei mit demselben Namen wird nie überschrieben.
+Prüfe und bestätige das Ziel in der ILIAS-Karte. Dateien werden im eingestellten
+Download-Ordner gespeichert. Andere Dateien mit demselben Namen bleiben erhalten.
 
 **Prüfungsvorbereitung.**
 

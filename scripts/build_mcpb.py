@@ -23,6 +23,7 @@ def main() -> None:
     target = args.output_dir / f"ilias-mcp-{version}.mcpb"
     files = [root / name for name in ("pyproject.toml", "README.md", "LICENSE")]
     files.extend(sorted((root / "src/ilias_mcp").glob("*.py")))
+    files.extend(sorted((root / "src/ilias_mcp/assets").glob("*.html")))
     with ZipFile(target, "w", ZIP_DEFLATED) as bundle:
         bundle.writestr("manifest.json", json.dumps(manifest, indent=2) + "\n")
         bundle.write(claude / "entry.py", manifest["server"]["entry_point"])

@@ -36,6 +36,9 @@ ilias-mcp-chatgpt = "ilias_mcp.chatgpt:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+ilias_mcp = ["assets/*.html"]
+
 [tool.setuptools.dynamic]
 version = {attr = "ilias_mcp.__version__"}
 

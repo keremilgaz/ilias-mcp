@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="tr">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ILIAS onayı</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    font: 14px/1.5 var(--font-sans, Inter, system-ui, sans-serif);
+    color: var(--color-text-primary, light-dark(#202522, #f0f3f1));
+    background: var(--color-background-primary, light-dark(#fff, #202321));
+  }
+  body { margin: 0; }
+  main { padding: 16px; }
+  h1 { font-size: 1.2rem; margin: 0 0 8px; }
+  p { margin: 0; }
+  dl { margin: 0; }
+  .row { display: grid; grid-template-columns: minmax(90px, 1fr) minmax(0, 3fr); gap: 8px; padding: 3px 0; }
+  dt { color: var(--color-text-secondary, light-dark(#515951, #b9c4bb)); }
+  dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; unicode-bidi: plaintext; }
+  #preview { max-height: 440px; overflow: auto; }
+  footer { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  button {
+    font: inherit; padding: 6px 13px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--color-border-secondary, light-dark(#a3aea6, #77847a));
+    background: transparent; color: inherit;
+  }
+  button:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+  #approve { background: light-dark(#234c3d, #c2e6d3); color: light-dark(#fff, #172a20); border-color: transparent; }
+  button:disabled { opacity: .55; cursor: default; }
+  #status { margin-top: 10px; }
+  [hidden] { display: none !important; }
+</style>
+<body>
+<main>
+  <h1 id="title">ILIAS onayı</h1>
+  <div id="preview" hidden></div>
+  <footer id="actions" hidden>
+    <button id="decline" type="button">Reddet</button>
+    <button id="approve" type="button">Onayla</button>
+  </footer>
+  <p id="status" role="status" aria-live="polite">İşlem bekleniyor…</p>
+</main>
+<script>
+  "use strict";
+
+  const host = window.parent;
+  const title = document.querySelector("#title");
+  const preview = document.querySelector("#preview");
+  const actions = document.querySelector("#actions");
+  const status = document.querySelector("#status");
+  const approve = document.querySelector("#approve");
+  const decline = document.querySelector("#decline");
+
+  const outcomes = {
+    saved: "Dosya kaydedildi.", already_present: "Dosya bu konumda zaten var.",
+    committed: "Karşılaştırma noktası kaydedildi.", declined: "İşlem reddedildi.",
+    denied: "İşlem reddedildi.", stale: "İşlem ayrıntıları değişti. Yeni bir onay iste.",
+    expired: "Onayın süresi doldu veya istek zaten yanıtlandı.",
+    unknown_outcome: "İşlemin sonucu doğrulanamadı. Tekrar denemeden önce kontrol et.",
+    approval_expired: "Onayın süresi doldu veya istek zaten yanıtlandı.",
+    approval_unavailable: "Bu istemcide onay kullanılamıyor.",
+    unknown: "İşlemin sonucu doğrulanamadı. Yeniden denemeden önce kontrol et.",
+  };
+
+  let token;
+  let connected = false;
+  let state = "waiting";
+  let replyTimer;
+
+  function post(message) {
+    host.postMessage({jsonrpc: "2.0", ...message}, "*");
+  }
+
+  function line(label, value) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const key = document.createElement("dt");
+    key.textContent = label;
+    const text = document.createElement("dd");
+    text.textContent = value;
+    row.append(key, text);
+    return row;
+  }
+
+  function finish(result) {
+    if (replyTimer) clearTimeout(replyTimer);
+    state = "finished";
+    token = undefined;
+    actions.hidden = true;
+    const key = result?.status;
+    status.textContent = Object.hasOwn(outcomes, key) ? outcomes[key] :
+      (result?.message || "İşlem tamamlanamadı.");
+    if (typeof result?.saved_to === "string") status.textContent += " " + result.saved_to;
+  }
+
+  function resultData(result) {
+    if (result?.structuredContent) return result.structuredContent;
+    try {
+      return JSON.parse(result?.content?.[0]?.text);
+    } catch {
+      return undefined;
+    }
+  }
+
+  function loadPreview(result) {
+    if (state !== "waiting") return;
+    const ref = result?.structuredContent?.approval_ref ||
+      result?.content?.[0]?.text?.match(/(?:^|\n)Approval reference: ([a-f0-9-]{32,36})(?:$|\n)/)?.[1];
+    if (typeof ref !== "string" || !/^(?:[a-f0-9]{32}|[a-f0-9-]{36})$/.test(ref)) {
+      finish(resultData(result) || {message: result?.content?.[0]?.text});
+      return;
+    }
+    state = "loading";
+    post({
+      id: 3, method: "tools/call",
+      params: {name: "ilias_card_preview", arguments: {approval_ref: ref}},
+    });
+    replyTimer = setTimeout(() => finish({status: "approval_unavailable"}), 15000);
+  }
+
+  function show(card) {
+    if (state !== "loading") return;
+    if (replyTimer) clearTimeout(replyTimer);
+    if (card?.status !== "approval_required" || typeof card.token !== "string"
+        || !/^[A-Za-z0-9_-]{43}$/.test(card.token) || typeof card.preview?.title !== "string" || !Array.isArray(card.preview.fields)) {
+      finish(card?.status === "approval_required" ? {status: "approval_unavailable"} :
+        card || {status: "approval_unavailable"});
+      return;
+    }
+    const detail = card.preview;
+    title.textContent = detail.title;
+    const details = document.createElement("dl");
+    for (const field of detail.fields) {
+      if (typeof field.label === "string" && typeof field.value === "string") {
+        details.append(line(field.label, field.value || "—"));
+      }
+    }
+    preview.replaceChildren(details);
+    token = card.token;
+    state = "ready";
+    preview.hidden = false;
+    actions.hidden = false;
+    status.textContent = "";
+  }
+
+  function decide(event, decision) {
+    if (!event.isTrusted || state !== "ready" || !token) return;
+    state = "submitting";
+    approve.disabled = decline.disabled = true;
+    status.textContent = decision === "approve" ? "İşlem uygulanıyor…" : "İstek reddediliyor…";
+    post({
+      id: 2, method: "tools/call",
+      params: {name: "ilias_card_decide", arguments: {token, decision}},
+    });
+    token = undefined;
+    replyTimer = setTimeout(() => finish({status: "unknown"}), 90000);
+  }
+
+  approve.addEventListener("click", event => decide(event, "approve"));
+  decline.addEventListener("click", event => decide(event, "decline"));
+
+  window.addEventListener("message", event => {
+    if (event.source !== host || event.data?.jsonrpc !== "2.0") return;
+    const message = event.data;
+    if (message.id === 1 && !connected) {
+      if (!message.result?.protocolVersion) {
+        finish({message: "Onay kartı Claude ile bağlantı kuramadı."});
+        return;
+      }
+      connected = true;
+      if (["light", "dark"].includes(message.result.hostContext?.theme)) {
+        document.documentElement.style.colorScheme = message.result.hostContext.theme;
+      }
+      post({method: "ui/notifications/initialized"});
+      new ResizeObserver(() => post({
+        method: "ui/notifications/size-changed",
+        params: {width: document.body.scrollWidth, height: document.body.scrollHeight},
+      })).observe(document.body);
+      return;
+    }
+    if (!connected) return;
+    if (message.method === "ui/notifications/tool-result") loadPreview(message.params);
+    if (message.id === 3) show(resultData(message.result));
+    if (message.method === "ui/notifications/tool-cancelled" && state === "waiting") {
+      finish({message: "İstek iptal edildi."});
+    }
+    if (message.method === "ui/notifications/host-context-changed" && ["light", "dark"].includes(message.params?.theme)) {
+      document.documentElement.style.colorScheme = message.params.theme;
+    }
+    if (message.id === 2 && state === "submitting") {
+      const result = resultData(message.result) || {status: "unknown"};
+      finish(result);
+      post({id: 4, method: "ui/update-model-context", params: {
+        content: [{type: "text", text: status.textContent}],
+      }});
+    }
+    if (message.method === "ui/resource-teardown" && message.id !== undefined) {
+      if (replyTimer) clearTimeout(replyTimer);
+      token = undefined;
+      post({id: message.id, result: {}});
+    }
+  });
+
+  post({
+    id: 1, method: "ui/initialize",
+    params: {appInfo: {name: "ILIAS onayı", version: "0.4.4"}, appCapabilities: {}, protocolVersion: "2026-01-26"},
+  });
+</script>
+</body>
+</html>

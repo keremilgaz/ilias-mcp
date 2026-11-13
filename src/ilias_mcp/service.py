@@ -478,12 +478,16 @@ class IliasService:
         result["text"] = returned
         return result
 
-    def download_file(self, target: str, dest_dir: str) -> dict:
+    def download_directory(self, dest_dir: str) -> Path:
         root = Path(self.settings.download_root).expanduser().resolve()
         dest = Path(dest_dir).expanduser()
         dest = (dest if dest.is_absolute() else root / dest).resolve()
         if dest != root and root not in dest.parents:
             raise ValueError(f"dest_dir must be inside {root}")
+        return dest
+
+    def download_file(self, target: str, dest_dir: str) -> dict:
+        dest = self.download_directory(dest_dir)
         key, urls = self._file_key_and_urls(target)
         download = self.client.get_file(urls)
         self.cache.store(key, download.content, download.filename, self._fresh_listing.get(key))
@@ -634,15 +638,21 @@ class IliasService:
             )
         return result
 
-    def commit_scan(self, scan_id: str) -> dict:
+    def pending_scan_path(self, scan_id: str) -> Path:
         if not re.fullmatch(r"[0-9a-f]{12}", scan_id or ""):
             raise ValueError("invalid scan_id")
         bundle_path = self.snapshots / "pending" / f"check-{scan_id}.json"
         if bundle_path.exists():
-            return self._commit_check(scan_id, bundle_path)
+            return bundle_path
         pending_path = self.snapshots / "pending" / f"{scan_id}.json"
         if not pending_path.exists():
             raise ValueError("unknown or already committed scan_id")
+        return pending_path
+
+    def commit_scan(self, scan_id: str) -> dict:
+        pending_path = self.pending_scan_path(scan_id)
+        if pending_path.name.startswith("check-"):
+            return self._commit_check(scan_id, pending_path)
         pending = json.loads(pending_path.read_text("utf-8"))
         pending["committed_at"] = dates.now_berlin().isoformat(timespec="minutes")
         target = self.snapshots / f"{pending['target']}.json"

@@ -4,20 +4,27 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import importlib
+import json
 import logging
+import re
+import sqlite3
 import sys
 import threading
 import time
+from importlib.resources import files
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import anyio
 import httpx
-from mcp.server.mcpserver import MCPServer
-from mcp.types import ToolAnnotations
+from mcp.server.apps import Apps, client_supports_apps
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from . import __version__, dates, parsers
+from .card_store import CardStore
 from .client import BudgetExceeded, IliasClient, IliasError, LoginError
 from .config import ConfigError, Settings, load_settings, prepare_cache
 from .credentials import CredentialError
@@ -38,19 +45,28 @@ ilias_read_file for new PDFs -> ilias_commit_scan(check_id) once the findings
 are recorded. ilias_scan does the same for a single course.
 ilias_read_file remembers which pages of which file version were read and
 returns 'already_read' for unchanged files unless pages are asked for.
+Ask the user to use the ILIAS approval card to save a file or a scan baseline.
+The card shows the final result. A pending approval does not confirm a save.
 Targets accept a URL, 'crs/123' style references or a bare ref_id.
 Requests are rate-limited (one per second), so a full check takes about a
 minute; ilias_check_all keeps working in the background and is simply called
 again until it returns its result.
 """
 
-mcp = MCPServer(name="ilias", version=__version__, instructions=INSTRUCTIONS)
+CARD_URI = "ui://ilias/approval.html"
+apps = Apps()
+apps.add_html_resource(CARD_URI, files("ilias_mcp").joinpath("assets", "approval.html").read_text("utf-8"),
+                       name="ILIAS approval", prefers_border=True)
+mcp = MCPServer(name="ilias", version=__version__, instructions=INSTRUCTIONS, extensions=[apps])
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
+LOCAL_READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+CARD_META = {"ui": {"resourceUri": CARD_URI, "visibility": ["model"]}}
 
 _service: IliasService | None = None
 _service_lock = threading.Lock()
 _settings: Settings | None = None
 _mtimes: dict[str, float] = {}
+_commit_lock = threading.Lock()
 
 
 def configure(service: IliasService) -> None:
@@ -105,6 +121,8 @@ def _tool(limit: int | None = None) -> Callable:
                     return {"error": str(exc)}
                 except httpx.HTTPError as exc:
                     return {"error": f"network error: {type(exc).__name__}: {exc}"}
+                except (OSError, sqlite3.Error):
+                    return {"error": "The local ILIAS operation could not be completed."}
                 except ValueError as exc:
                     return {"error": str(exc)}
 
@@ -242,7 +260,7 @@ def _start_check(service: IliasService, exclude: list[str], section: str | None,
         try:
             with service.client.call_scope(400):
                 job["result"] = service.check_all(exclude=exclude, section=section, depth=depth,
-                                                  progress=job["progress"].update)
+                                                  progress=job["progress"].update, auto_commit=False)
         except PolicyViolation as exc:
             job["result"] = {"error": f"blocked by the read-only policy: {exc}"}
         except (LoginError, CredentialError) as exc:
@@ -270,9 +288,8 @@ async def ilias_check_all(
     The semester is the newest dashboard section unless `section` is given; `exclude`
     takes ref_ids ('2101331' or 'crs/2101331') of courses to skip. The check runs in the
     background: if the answer is status 'running', call this tool again to keep waiting
-    (it does not start a second check). If nothing changed, the check is saved as the new
-    baseline automatically ('committed': true); otherwise record the findings and then call
-    ilias_commit_scan(check_id).
+    (it does not start a second check). Record any findings and use
+    ilias_commit_scan(check_id) to review and approve saving the new baseline.
     """
 
     def work() -> dict:
@@ -300,21 +317,156 @@ async def ilias_check_all(
     return await anyio.to_thread.run_sync(work)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False))
-@_tool()
-def ilias_commit_scan(service: IliasService, scan_id: str) -> dict:
-    """Make a scan, or a whole ilias_check_all check (pass its check_id), the new baseline.
-    Local bookkeeping only; nothing is sent to ILIAS."""
-    return service.commit_scan(scan_id)
+def _result(data: dict) -> CallToolResult:
+    return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False))],
+                          structured_content=data)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
+def _supports_card(ctx: Context) -> bool:
+    if client_supports_apps(ctx):
+        return True
+    # Claude Desktop's local stdio connection can render Apps without advertising them.
+    params = ctx.session.client_params
+    return params is not None and params.client_info.name == "claude-desktop-3p"
+
+
+def _card_store(service: IliasService) -> CardStore:
+    return CardStore(service.settings.account_dir / "approval-cards.sqlite3")
+
+
 @_tool()
-def ilias_download_file(service: IliasService, target: str, dest_dir: str) -> dict:
-    """Save a course file to a folder inside the configured download root
-    (ILIAS_DOWNLOAD_ROOT, default ~/Documents/ILIAS). Never overwrites a different file.
-    """
+def _save_card(service: IliasService, account: str, title: str, fields: list[tuple[str, str]],
+               handler: str, arguments: dict) -> dict:
+    if str(service.settings.account_dir) != account:
+        return {"status": "stale"}
+    preview = {"title": title, "fields": [{"label": label, "value": value} for label, value in fields]}
+    ref = _card_store(service).create({"preview": preview, "handler": handler, "arguments": arguments})
+    return {"status": "approval_required", "approval_ref": ref} if ref else {"status": "approval_pending"}
+
+
+async def _card(account: str, title: str, fields: list[tuple[str, str]], handler: str,
+                arguments: dict) -> CallToolResult:
+    data = await _save_card(account, title, fields, handler, arguments)
+    if not (ref := data.get("approval_ref")):
+        return _result({"status": "unavailable", **data})
+    return CallToolResult(
+        content=[TextContent(type="text", text=f"ILIAS işlemi onay bekliyor. Sohbetteki onay kartını kullan.\nApproval reference: {ref}")],
+        structured_content=data,
+    )
+
+
+@_tool()
+def _scan_preview(service: IliasService, scan_id: str) -> dict:
+    path = service.pending_scan_path(scan_id)
+    raw = path.read_bytes()
+    data = json.loads(raw)
+    scope = data.get("title") or f"Dönem taraması · {len(data.get('scan_ids', []))} ders"
+    return {
+        "stamp": hashlib.sha256(raw).hexdigest(),
+        "account": str(service.settings.account_dir),
+        "fields": [("Tarama kimliği", scan_id),
+                   ("Hesap", service.settings.username),
+                   ("Kapsam", str(scope)),
+                   ("Tarama zamanı", str(data.get("scanned_at") or data.get("checked_at") or ""))],
+    }
+
+
+@_tool()
+def _save_scan(service: IliasService, scan_id: str, stamp: str, account: str) -> dict:
+    with _commit_lock:
+        if str(service.settings.account_dir) != account:
+            return {"status": "stale"}
+        try:
+            current = service.pending_scan_path(scan_id).read_bytes()
+        except (ValueError, FileNotFoundError):
+            return {"status": "stale"}
+        if hashlib.sha256(current).hexdigest() != stamp:
+            return {"status": "stale"}
+        return {"status": "committed", **service.commit_scan(scan_id)}
+
+
+@mcp.tool(annotations=LOCAL_READ, meta=CARD_META)
+async def ilias_commit_scan(scan_id: str, ctx: Context) -> CallToolResult:
+    """Review saving a scan or a full check as the next local comparison baseline."""
+    if not _supports_card(ctx):
+        return _result({"status": "approval_unavailable", "error": "This client does not support the ILIAS approval card."})
+    data = await _scan_preview(scan_id)
+    if "error" in data:
+        return _result({"status": "invalid", **data})
+    return await _card(data["account"], "Karşılaştırma noktasını kaydet", data["fields"], "scan",
+                       {"scan_id": scan_id, "stamp": data["stamp"], "account": data["account"]})
+
+
+@_tool()
+def _download_preview(service: IliasService, target: str, dest_dir: str) -> dict:
+    _, urls = service._file_key_and_urls(target)
+    for url in urls:
+        service.client.policy.check("GET", service.client.absolute(url))
+    return {"path": str(service.download_directory(dest_dir)), "account": str(service.settings.account_dir),
+            "username": service.settings.username}
+
+
+@_tool()
+def _save_download(service: IliasService, target: str, dest_dir: str, account: str) -> dict:
+    if str(service.settings.account_dir) != account or service.download_directory(dest_dir) != Path(dest_dir):
+        return {"status": "stale"}
     return service.download_file(target, dest_dir)
+
+
+@mcp.tool(annotations=LOCAL_READ, meta=CARD_META)
+async def ilias_download_file(target: str, dest_dir: str, ctx: Context) -> CallToolResult:
+    """Review saving a course file to a folder inside the configured download root."""
+    if not _supports_card(ctx):
+        return _result({"status": "approval_unavailable", "error": "This client does not support the ILIAS approval card."})
+    data = await _download_preview(target, dest_dir)
+    if "error" in data:
+        return _result({"status": "invalid", **data})
+    return await _card(data["account"], "Dosyayı diske kaydet",
+                       [("Hesap", data["username"]), ("ILIAS dosyası", target), ("Hedef klasör", data["path"])],
+                       "download", {"target": target, "dest_dir": data["path"], "account": data["account"]})
+
+
+@_tool()
+def _read_card(service: IliasService, approval_ref: str) -> dict:
+    preview = _card_store(service).preview(approval_ref)
+    return {"status": "approval_required", **preview} if preview else {"status": "approval_expired"}
+
+
+@_tool()
+def _take_card(service: IliasService, token: str) -> dict:
+    return _card_store(service).take(token) or {"status": "approval_expired"}
+
+
+@mcp.tool(annotations=LOCAL_READ, meta={"ui": {"resourceUri": CARD_URI, "visibility": ["app"]}})
+async def ilias_card_preview(approval_ref: str, ctx: Context) -> CallToolResult:
+    """Load the pending preview for this approval card."""
+    if not _supports_card(ctx):
+        return _result({"status": "approval_unavailable"})
+    return _result({"status": "unavailable", **await _read_card(approval_ref)})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True),
+          meta={"ui": {"resourceUri": CARD_URI, "visibility": ["app"]}})
+async def ilias_card_decide(token: str, decision: Literal["approve", "decline"], ctx: Context) -> CallToolResult:
+    """Respond to a single pending ILIAS approval card."""
+    if not _supports_card(ctx):
+        return _result({"status": "approval_unavailable"})
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        return _result({"status": "approval_expired"})
+    pending = await _take_card(token)
+    if "handler" not in pending:
+        return _result({"status": "unavailable", **pending})
+    if decision == "decline":
+        return _result({"status": "declined"})
+    if pending["handler"] == "scan":
+        data = await _save_scan(**pending["arguments"])
+    elif pending["handler"] == "download":
+        data = await _save_download(**pending["arguments"])
+    else:
+        return _result({"status": "invalid"})
+    if "error" in data:
+        return _result({"status": "unavailable", "message": data["error"]})
+    return _result(data)
 
 
 def main(*, require_account: bool = True) -> None:
